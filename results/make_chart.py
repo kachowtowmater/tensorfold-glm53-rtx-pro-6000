@@ -8,7 +8,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import numpy as np, os
 
 W,H=1600,900; BAND=290; DPI=100
-NAVY="#0b1663"; NAVY2="#070e3d"; CARD="#101c6f"; EDGE="#2a3a9c"; FG="#f5f7ff"; MUTED="#b7c0ee"; DIM="#7d88cf"
+NAVY="#000000"; NAVY2="#000000"; CARD="#0e0e12"; EDGE="#2a2a33"; FG="#ffffff"; MUTED="#b9bcc8"; DIM="#7c8090"
 CORAL="#ff9a7a"; VIOLET="#c08cff"; BLUE="#7cc4ff"; LIME="#9af7c0"
 
 # ---- cards (matplotlib) ----
@@ -45,6 +45,12 @@ fig.savefig("/tmp/_cards.png",dpi=DPI,facecolor=NAVY2); plt.close(fig)
 
 # ---- compose with the official hero ----
 hero=Image.open("results/assets/tensorfold-hero.png").convert("RGB")
+arr=np.asarray(hero).astype(np.float32)
+bgc=np.array([11,22,99],dtype=np.float32)           # the flat navy backdrop
+dist=np.sqrt(((arr-bgc)**2).sum(axis=2))             # colour distance from the backdrop
+k=np.clip((dist-18)/60,0,1)[...,None]                # 0 = backdrop, 1 = mesh
+arr=arr*k                                            # backdrop → black, mesh untouched
+hero=Image.fromarray(arr.clip(0,255).astype(np.uint8)); hero.save("results/assets/tensorfold-hero-black.png")
 hw,hh=hero.size; scale=W/hw; hero=hero.resize((W,int(hh*scale)),Image.LANCZOS)
 top=max(0,(hero.size[1]-BAND)//2); band=hero.crop((0,top,W,top+BAND))
 out=Image.new("RGB",(W,H),NAVY2); out.paste(band,(0,0)); out.paste(Image.open("/tmp/_cards.png").convert("RGB"),(0,BAND))

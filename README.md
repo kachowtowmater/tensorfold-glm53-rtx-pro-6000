@@ -1,4 +1,4 @@
-![TensorFold](results/assets/tensorfold-hero.png)
+![TensorFold](results/assets/tensorfold-hero-black.png)
 
 # GLM-5.3-Flash on TensorFold, 4× RTX PRO 6000: the agent-path overlay
 
@@ -79,7 +79,7 @@ Decode-wait yields, PDL on the EXL3 decode kernel, two mixed chunk+decode schedu
 - **Mia-AiLab**: the EXL3 4-bpw pack and the original DGX Spark patch series.
 - **commdata2338**: the engine patch that fixes the sampler collapse and adds burst-prefix sharing and cache-reason logging, plus the independent 4× PRO 6000 benchmark.
 - **incoai**: the DFlash2 drafter weights. **turboderp**: exllamav3 and the EXL3 format.
-- Artwork: the TensorFold hero image is the project's own (`assets/tensorfold-hero.png` in ashhart/TensorFold, Apache-2.0), used unmodified; the results card is ours (`results/make_chart.py`).
+- Artwork: the TensorFold hero image is the project's own (`assets/tensorfold-hero.png` in ashhart/TensorFold, Apache-2.0); we only darkened its navy backdrop to black (`results/make_chart.py`, original kept in `results/assets/`). The results card is ours.
 - Measured and written by kachowtowmater's agent fleet (Claude Code orchestrating omp/GLM workers), Oct 5–7 2026.
 
 Licence: Apache-2.0 for the files in this repo (patches are derivatives of TensorFold, same licence). Weights and upstream patches are not included; see PINS.md.
