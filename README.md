@@ -4,11 +4,27 @@
 
 Two custom TensorFold patches, a tuned knob file, the measurement scripts, and every result (including the ones that lost) from two days of paired A/B on one box: 4× NVIDIA RTX PRO 6000 Blackwell Max-Q (96 GB each, PCIe, 250 W cap), TensorFold v0.6.5 with the Aevonix 86-patch recipe, Mia-AiLab's EXL3 4-bpw pack, the DFlash2 drafter.
 
+## What you gain
+
+If you run coding agents (long prompts, tool calls, images, several at once) against this serve, this is the difference, measured on the same box with the same prompts, before → after:
+
+| what | before | after | how much | where it comes from |
+|---|---|---|---|---|
+| Time to first token on an image turn (28k-token conversation with a picture; turns 2 and 3) | 2.87 s, every turn | **0.12 s** | **24× faster** | patch 0910: the text prefix stays cached instead of being re-prefilled |
+| Prefill seconds burned by image turns on a day of agent traffic | 80% of all prefill time | ~0 | | same patch (632 of 4,365 requests were doing this) |
+| 4 cold agents starting on the same 40k-token repo | TTFT 6.3–12.4 s each, turn ~13 s | **3.3 s each, turn 4.2 s** | **3× faster** | burst-prefix sharing (commdata2338's engine patch, optional) |
+| Decode when a client sends `top_k=-1` / `top_p 1.0` | 24 tok/s (CPU sampler collapse) | **188 tok/s** | **7.8×** | same patch |
+| Agent turn time at 8 concurrent agents, real traffic | 5.8 s on our old SGLang serve | **2.5 s** | **2.3× faster** | TensorFold + this recipe |
+| Kept-state cache evictions per ~1,000 agent requests | 40 | **0** | | `TF_GLM_CACHE_ENTRIES` 64 → 128 |
+| 4-agent warm turn / TTFT p90 / churn warm turn | 2.9 s / 0.98 s / 5.8 s (recipe defaults) | **2.5 s / 0.51 s / 3.1 s** | 14–47% | window, graph step, prefill rows, cache knobs |
+| Cold TTFT under 40-conversation churn | 5.9 s | **5.2 s** | 12% | `TF_GLM_HC_SPLIT_MIN_ROWS` 512 → 2048 (small fills skip the 4-rank split) |
+| Quality (gsm8k full test set, our harness) | 96.5% | 96.5% | unchanged | nothing here touches the weights |
+
+What you do **not** gain: raw single-stream decode. It stays at the Aevonix recipe's number (223 tok/s prose, 433 code, greedy, server-side). We measured why rather than guessing: under speculative decoding each MoE layer touches ~60 distinct experts per step whatever you do to the weights, so expert bytes are ~18% of a step; cutting them 25% (top-k 8 → 6) kept quality and changed speed 0%. That is why the requant is parked. Details and every table: [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md).
+
 ![what improved 1/2](results/cards-1-black.png)
 
 ![what improved 2/2](results/cards-2-black.png)
-
-This overlay does **not** make single-stream decode faster. It stays at the Aevonix recipe's number (223 tok/s prose, 433 code, greedy, server-side). What it changes is what coding agents feel: cold bursts, image turns, cache behaviour, and the sampler edge case that collapsed throughput. The reason raw decode is where it is: under speculative decoding each MoE layer touches ~60 distinct experts per step no matter what you do to the weights, so expert bytes are ~18% of a step; we measured that by cutting them 25% (top-k 8 → 6) and getting 0%. Details in [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md).
 
 ## What is in here
 
