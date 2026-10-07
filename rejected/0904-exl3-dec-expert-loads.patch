@@ -1,0 +1,271 @@
+--- tensorfold/families/glm5_next/cuda/exl3.cpp
++++ tensorfold/families/glm5_next/cuda/exl3.cpp
+@@ -19,7 +19,7 @@
+ void exl3_dec_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                    const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+                    int64_t, int64_t, int64_t, int64_t, bool, const at::Tensor&, const at::Tensor&,
+-                   const at::Tensor&, at::Tensor&, double, at::Tensor&, int64_t, int64_t);
++                   const at::Tensor&, at::Tensor&, double, at::Tensor&, int64_t, int64_t, bool);
+ 
+ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
+@@ -111,12 +111,14 @@
+ 
+ // Decode windows: the grouped kernel's sums; fuse 1 writes Y (down, its epilogue fused), 2 writes Xd
+ // (gate/up, the epilogue run by each (item, n block)'s last block; ``done`` zeroed ints, reset by the kernel).
+-// wn: warps along N a block (1, 2; 4 with ld 0), the same bits.
++// wn: warps along N a block (1, 2; 4 with ld 0), the same bits. pdl: launch as a programmatic dependent (sm_90+,
++// jayleaton/glm53-tensorfold-spark patches/0580's GLM53_TF_DEC_EXPERT_LOADS_PDL; the prologue reads only the plan
++// and the constant trellis before griddepcontrol.wait) — the same bits.
+ void dec(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T0, const at::Tensor& T1, const at::Tensor& items,
+          const at::Tensor& counts, const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N,
+          int64_t P, int64_t SK, int64_t max_items, int64_t slots, int64_t fuse, bool xrow,
+          const at::Tensor& sv0, const at::Tensor& sv1, const at::Tensor& su2, at::Tensor out, double limit,
+-         at::Tensor done, int64_t ld, int64_t wn) {
++         at::Tensor done, int64_t ld, int64_t wn, bool pdl) {
+     const int64_t E = T0.size(0);
+     for (auto* t : {&X0, &X1, &sv0, &sv1, &su2}) check(*t, at::kHalf, "dec: fp16 input");
+     for (auto* t : {&T0, &T1, &items, &counts, &members}) check(*t, at::kInt, "dec: int32 input");
+@@ -130,7 +132,7 @@
+     TORCH_CHECK(ld == 0 || items.numel() >= 3 * max_items, "dec: items [max_items, 3] for the 16-byte load path");
+     c10::cuda::CUDAGuard guard(X0.device());
+     exl3_dec_cuda(X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, E, slots, fuse, xrow,
+-                  sv0, sv1, su2, out, limit, done, ld, wn);
++                  sv0, sv1, su2, out, limit, done, ld, wn, pdl);
+ }
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+--- tensorfold/families/glm5_next/cuda/exl3.cu
++++ tensorfold/families/glm5_next/cuda/exl3.cu
+@@ -15,6 +15,8 @@
+ #include <ATen/cuda/CUDAContext.h>
+ #include <c10/cuda/CUDAGuard.h>
+ 
++#include <memory>
++
+ namespace {
+ 
+ constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
+@@ -74,6 +76,16 @@
+     return v;
+ }
+ 
++// Programmatic dependent launch (patches/0580's GLM53_TF_DEC_EXPERT_LOADS_PDL): blocks until the previous kernel
++// (a plain launch, so completed) has flushed its memory. Before the wait the prologue reads only the plan
++// (items / counts / members, written before the routed pass starts) and the constant trellis. Without the launch
++// attribute the wait returns at once.
++__device__ __forceinline__ void pdl_wait() {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
++    asm volatile("griddepcontrol.wait;" ::: "memory");
++#endif
++}
++
+ // Grid (item, n block, mat * SK + split) -> Z[mat][split][pair][n]; warps sum fixed k ranges, added in warp order.
+ // SEQ (prompt chunks): grid (.., .., mat); one program runs the SK splits in turn and writes Z[mat][0][pair][n] =
+ // ((0 + split 0) + split 1) + ..., the epilogue's own sum, so an SK = 1 epilogue gives the same bits without the
+@@ -347,11 +359,19 @@
+ //      ld.global.nc.L1::no_allocate.v4 (lane l: bytes 16 l .. of each 512 B of a step, NT / 4 loads a lane), PD
+ //      steps in flight, through a 1 KB staging area in the warp's own slice of `red` (two __syncwarp a step), read
+ //      back as word `lane` of each tile.
+-// WN (data movement only): WN warps along N share a block's NT tiles, NT / WN each, for every one of the
++//   WN (data movement only): WN warps along N share a block's NT tiles, NT / WN each, for every one of the
+ //   W warps along K: warp (wk, wn) runs k tiles kt0 .. of K warp wk on tiles wn * NT / WN .. of the block, so each
+ //   output's chain is the one of K warp wk at WN = 1, and the K warps are added in the same order (red[wk]). WN times
+ //   the warps in flight a block at the same grid (the GB10-sized grid leaves a 188-SM card's SMs half empty). LD 1
+ //   then stages through its own shared array (red's warp slices hold WN warps' sums).
++// PDL (a launch attribute, TF_GLM_EXL3_DEC_LOADS=nc8pdl; after jayleaton/glm53-tensorfold-spark patches/0580,
++//   GLM53_TF_DEC_EXPERT_LOADS_PDL): the prologue -- the items / counts / members reads and the first PD k steps of
++//   trellis words -- runs before griddepcontrol.wait, overlapping the previous kernel's tail (rot_in or the fused
++//   epilogue of the other matrix); X / Xd are read and Z / Xd / Y / done written only after it. Safe because the
++//   plan (items / counts / members) is written before the routed pass starts and the launch right before this one
++//   is a plain launch, so every earlier kernel has completed; the trellis is constant. Without the attribute
++//   griddepcontrol.wait returns at once; nothing triggers dependents (the kernels after this one are plain
++//   launches). Data movement only: the same chains, sums and stores -- the same bits.
+ template <int NT, int W, int STEPS, int FUSE, bool XROW, int LD = 0, int PD = 1, int WN = 1>
+ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
+     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
+@@ -397,6 +417,7 @@
+             for (int v = 0; v < NV; ++v) rv[d][v] = ldg_nc_v4(tbase + d * kstep + 128 * v + 4 * lane);
+     }
+     if (threadIdx.x < 16) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
++    pdl_wait();                                          // PDL: X / Xd (and Z / Y) belong to the kernels before
+     __syncthreads();
+     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+     const int xr0 = r0 < 0 ? 0 : (XROW ? r0 / slots : r0), xr1 = r1 < 0 ? 0 : (XROW ? r1 / slots : r1);
+@@ -1010,18 +1031,51 @@
+                        int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
+                        int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
+                        const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld,
+-                       int64_t wn) {
++                       int64_t wn, bool pdl) {
+     constexpr int NT = 8, W = 4;
+     constexpr int PD4 = STEPS % 4 == 0 ? 4 : 2;
+     dim3 grid((unsigned)max_items, (unsigned)(N / (16 * NT)), (unsigned)(mats * SK));
+     auto stream = at::cuda::getCurrentCUDAStream();
+     auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
+     auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
++    // PDL (TF_GLM_EXL3_DEC_LOADS=nc8pdl): launch as a programmatic dependent (sm_90+; patches/0580's launch<>),
++    // the prologue (plan reads + the first PD k steps of trellis words) overlapping the previous kernel's tail.
++    const bool pdl_ok = pdl &&
++        [] {
++            static cudaDeviceProp* props = nullptr;
++            if (!props) {
++                auto p = std::make_unique<cudaDeviceProp>();
++                int dev = 0;
++                C10_CUDA_CHECK(cudaGetDevice(&dev));
++                C10_CUDA_CHECK(cudaGetDeviceProperties(p.get(), dev));
++                props = p.release();
++            }
++            return props->major >= 9;
++        }();
+ #define DEC1(F_, XR_, LD_, PD_, WN_)                                                                              \
+-    dec_kernel<NT, W, STEPS, F_, XR_, LD_, PD_, WN_><<<grid, W * (WN_) * 32, 0, stream>>>(                        \
+-        h(X0), h(X1), w(T0), w(T1), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),       \
+-        Z.data_ptr<float>(), (int)K, (int)N, (int)P, (int)SK, (int)E, (int)slots, h(sv0), h(sv1), h(su2),         \
+-        out.data_ptr(), (float)limit, done.data_ptr<int>())
++    do {                                                                                                          \
++        if (pdl_ok) {                                                                                             \
++            cudaLaunchConfig_t cfg_ = {};                                                                         \
++            cfg_.gridDim = grid;                                                                                  \
++            cfg_.blockDim = dim3(W * (WN_) * 32);                                                                 \
++            cfg_.dynamicSmemBytes = 0;                                                                            \
++            cfg_.stream = stream;                                                                                 \
++            cudaLaunchAttribute attr_[1];                                                                         \
++            attr_[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                                     \
++            attr_[0].val.programmaticStreamSerializationAllowed = 1;                                              \
++            cfg_.attrs = attr_;                                                                                   \
++            cfg_.numAttrs = 1;                                                                                    \
++            C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg_, dec_kernel<NT, W, STEPS, F_, XR_, LD_, PD_, WN_>,            \
++                h(X0), h(X1), w(T0), w(T1), items.data_ptr<int>(), counts.data_ptr<int>(),                        \
++                members.data_ptr<int>(), Z.data_ptr<float>(), (int)K, (int)N, (int)P, (int)SK, (int)E,            \
++                (int)slots, h(sv0), h(sv1), h(su2), out.data_ptr(), (float)limit, done.data_ptr<int>()));         \
++        } else {                                                                                                  \
++            dec_kernel<NT, W, STEPS, F_, XR_, LD_, PD_, WN_><<<grid, W * (WN_) * 32, 0, stream>>>(                \
++                h(X0), h(X1), w(T0), w(T1), items.data_ptr<int>(), counts.data_ptr<int>(),                        \
++                members.data_ptr<int>(), Z.data_ptr<float>(), (int)K, (int)N, (int)P, (int)SK, (int)E,            \
++                (int)slots, h(sv0), h(sv1), h(su2), out.data_ptr(), (float)limit, done.data_ptr<int>());          \
++        }                                                                                                         \
++    } while (0)
+ #define DECW(F_, XR_, LD_, PD_)                                                                                   \
+     do { if (wn == 2) { DEC1(F_, XR_, LD_, PD_, 2); } else { DEC1(F_, XR_, LD_, PD_, 1); } } while (0)
+ #define DEC(F_, XR_)                                                                                              \
+@@ -1049,7 +1103,8 @@
+                    const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
+                    int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
+                    int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
+-                   const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld, int64_t wn) {
++                   const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld, int64_t wn,
++                   bool pdl) {
+     constexpr int NT = 8, W = 4;
+     TORCH_CHECK(ld >= 0 && ld <= 3, "decode expert kernel: loads 0 (32-bit), 1 / 2 / 3 (16-byte, 1 / 2 / 4 steps ahead)");
+     TORCH_CHECK(wn == 1 || wn == 2 || (wn == 4 && ld == 0),
+@@ -1059,7 +1114,7 @@
+     TORCH_CHECK(fuse != 2 || mats == 2, "the fused gate/up epilogue takes gate and up");
+     const int64_t steps = K / (16 * SK * W);
+ #define ARGS X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, E, slots, fuse, xrow, sv0, sv1, \
+-             su2, out, limit, done, ld, wn
++             su2, out, limit, done, ld, wn, pdl
+     if (steps == 16) dec_launch<16>(ARGS);
+     else if (steps == 12) dec_launch<12>(ARGS);
+     else if (steps == 10) dec_launch<10>(ARGS);
+--- tensorfold/families/glm5_next/cuda/exl3_mm.py
++++ tensorfold/families/glm5_next/cuda/exl3_mm.py
+@@ -66,6 +66,43 @@
+     return LOADS[v]
+ 
+ 
++DEC_LOADS = {"nc8": (1, False), "nc8pdl": (1, True)}
++
++
++def dec_dec_loads() -> tuple[int, bool]:
++    """TF_GLM_EXL3_DEC_LOADS (after jayleaton/glm53-tensorfold-spark patches/0580, GLM53_TF_DEC_EXPERT_LOADS +
++    _PDL; Apache-2.0): a floor on the decode kernel's trellis loads and its PDL launch, read once. ``''`` (the
++    default) keeps TF_GLM_EXL3_LOADS's own behavior byte for byte; ``nc8``: at least the 16-byte ld.global.nc
++    loads (ld 1, the 0580 LD_NC path; TF_GLM_EXL3_LOADS=nc2/nc4 stays deeper); ``nc8pdl``: that plus the kernel
++    launched as a programmatic dependent (sm_90+), its prologue overlapping the previous kernel's tail. The same
++    bits for every value: the PDL prologue reads only the plan (written before ``routed`` starts) and the constant
++    trellis; X / Xd and Z / Y are touched after ``griddepcontrol.wait``."""
++
++    v = os.environ.get("TF_GLM_EXL3_DEC_LOADS", "").strip().lower()
++    if v and v not in DEC_LOADS:
++        raise ValueError(f"TF_GLM_EXL3_DEC_LOADS: '', nc8 or nc8pdl, not {v!r}")
++    ld, pdl = DEC_LOADS.get(v, (0, False))
++    return ld, pdl
++
++
++_DEC_LOADS: tuple[int, bool] | None = None
++
++
++def dec_loads_cfg() -> tuple[int, bool]:
++    """``dec_dec_loads()`` read once (the flag's startup log says so; ranks may differ without changing a bit)."""
++
++    global _DEC_LOADS
++    if _DEC_LOADS is None:
++        _DEC_LOADS = dec_dec_loads()
++        if _DEC_LOADS[1]:
++            print(f"[tensorfold] TF_GLM_EXL3_DEC_LOADS={os.environ['TF_GLM_EXL3_DEC_LOADS']}: the EXL3 decode "
++                  f"kernel's 16-byte nc loads (ld >= 1) with a programmatic-dependent launch (PDL)", flush=True)
++        elif os.environ.get("TF_GLM_EXL3_DEC_LOADS"):
++            print("[tensorfold] TF_GLM_EXL3_DEC_LOADS=nc8: the EXL3 decode kernel's trellis loads at least "
++                  "ld 1 (16-byte nc, one k step ahead)", flush=True)
++    return _DEC_LOADS
++
++
+ def _seq() -> bool:
+     """TF_GLM_EXL3_SEQ (default on): prompt chunks sum a matmul's K splits in one program (same bits)."""
+     import os
+@@ -78,25 +115,29 @@
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_exl3_v20a2", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
++    return load(name="tensorfold_glm_exl3_v20a3", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+                 extra_cuda_cflags=["-O3"], verbose=False)
+ 
+ 
+ def dec_config(kind: str, K: int, N: int, R: int) -> dict:
+     """The decode kernel's launch for gate/up (``kind`` "gu": K = D, N = NI) or down ("dn": K = NI, N = D) at R rows:
+-    the environment's (TF_GLM_EXL3_LOADS / _FUSE / _XROW, one warp along N), then a launch table's entry for the shape
+-    and rows (TF_GLM_TUNE, ``tune``). Every value gives the same bits (``dec_kernel``'s notes)."""
++    the environment's (TF_GLM_EXL3_LOADS / TF_GLM_EXL3_DEC_LOADS / _FUSE / _XROW, one warp along N), then a launch
++    table's entry for the shape and rows (TF_GLM_TUNE, ``tune``). Every value gives the same bits
++    (``dec_kernel``'s notes; the table never carries ``pdl``: the 0580 PDL prologue is a launch setting, not a
++    same-bit knob the tuner picks)."""
+ 
+     _, fuse, xrow = dec_settings()
++    ld_floor, pdl = dec_loads_cfg()
+     if kind == "gu":
+-        cfg = {"ld": dec_loads(), "wn": 1, "fuse": 2 if fuse & 2 else 0, "xrow": int(xrow)}
++        cfg = {"ld": max(dec_loads(), ld_floor), "wn": 1, "fuse": 2 if fuse & 2 else 0, "xrow": int(xrow), "pdl": int(pdl)}
+     elif kind == "dn":
+-        cfg = {"ld": dec_loads(), "wn": 1, "fuse": 1 if fuse & 1 else 0}
++        cfg = {"ld": max(dec_loads(), ld_floor), "wn": 1, "fuse": 1 if fuse & 1 else 0, "pdl": int(pdl)}
+     else:
+         raise ValueError(f"dec_config: gu or dn, not {kind!r}")
+     t = tune.pick("exl3_dec_" + kind, tune.shape(K, N), R)
+     if t:
+         cfg.update(t)
++        cfg["pdl"] = int(pdl)                        # a table entry places work only; the PDL flag is not tunable
+     if cfg["wn"] == 4 and cfg["ld"] != 0:            # (tune refuses such an entry; a merge must not reach the kernel)
+         cfg["wn"] = 1
+     return cfg
+@@ -121,7 +162,8 @@
+         xg, xu = s.xg, s.xu
+     fused = 2 if int(cfg["fuse"]) == 2 else 0
+     ext.dec(xg, xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, 4, items, slots,
+-            fused, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done, int(cfg["ld"]), int(cfg["wn"]))
++            fused, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done, int(cfg["ld"]), int(cfg["wn"]),
++            bool(cfg["pdl"]))
+     if not fused:
+         ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, 4, slots, float(limit))
+ 
+@@ -137,7 +179,8 @@
+         items = grouped.max_items(R * slots, plan.experts)
+     fused = 1 if int(cfg["fuse"]) == 1 else 0
+     ext.dec(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, 1, items, slots,
+-            fused, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done, int(cfg["ld"]), int(cfg["wn"]))
++            fused, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done, int(cfg["ld"]), int(cfg["wn"]),
++            bool(cfg["pdl"]))
+     if not fused:
+         ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, 1, slots)
+ 

@@ -1,0 +1,146 @@
+diff --git a/src/tensorfold/families/glm5_next/cuda/multi.py b/src/tensorfold/families/glm5_next/cuda/multi.py
+index d02fbbd..9e89804 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -148,16 +148,19 @@ def fill_credit(value: str | None = None) -> str:
+     return value
+ 
+ 
+-def mixed_chunk(value: str | None = None) -> bool:
++def mixed_chunk(value: str | None = None) -> str:
+     """TF_GLM_MIXED_CHUNK (patch 0905, default 0): a prompt chunk's iteration carries a decode round with it —
+     one MFILLR message: the chunk's rows on the prompt buffers, then the round's verify window as today, back to
+     back in the same iteration (the round's kernels queue behind the chunk's on the stream). Off: every
+-    iteration stays exactly one op, as before."""
++    iteration stays exactly one op, as before. ``eager`` (patch 0908, MFILLR-E): the attached window is never a
++    graph replay — it runs the eager branch (verify.py: the same calls the graph body wraps) right behind the
++    chunk's MoE passes, so the decode launch's routed experts are read while the chunk just streamed them into
++    L2; the round pays eager launches instead of a replay (measured: the design's G1)."""
+ 
+     value = (os.environ.get("TF_GLM_MIXED_CHUNK", "") if value is None else value).strip() or "0"
+-    if value not in ("0", "1"):
+-        raise ValueError(f"TF_GLM_MIXED_CHUNK: 0 or 1, not {value!r}")
+-    return value == "1"
++    if value not in ("0", "1", "eager"):
++        raise ValueError(f"TF_GLM_MIXED_CHUNK: 0, 1 or eager, not {value!r}")
++    return value
+ 
+ 
+ def _ids_array(c) -> np.ndarray:
+@@ -417,6 +420,7 @@ class MultiDecoder:
+                 raise ValueError("TF_GLM_MULTI_PREFILL=1 needs the latent cache (TF_GLM_LATENT=1)")
+         self.unit = fill_unit(self.grid)
+         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
++        self.grouped["mixed"] = 0                                      # 0908: MFILLR iterations (chunk+round)
+         self.drafts = drafts
+         if self.drafts is None and engine.drafter is not None:
+             from . import dflash2_fast
+@@ -470,8 +474,10 @@ class MultiDecoder:
+         self.evicted_prefixes: list[tuple[int, bytes]] = []  # bounded fingerprints, never token text in logs
+         self.burst = os.environ.get("TF_GLM_BURST_PREFIX", "0").strip() == "1"
+         self.burst_wait: dict[int, tuple[int, int]] = {}     # consumer -> (producer, grid point), rank 0 only
+-        # patch 0905: read once; both ranks (rank 1 checks the op against it, as with the settings above)
+-        self.mixed_chunk = mixed_chunk()
++        # patch 0905: read once; both ranks (rank 1 checks the op against it, as with the settings above).
++        # 0908: "eager" (MFILLR-E) — the attached round's window always runs the eager verify branch.
++        self.mixed_chunk: str = mixed_chunk()
++        self.mixed_eager = self.mixed_chunk == "eager"
+         self.next_sid = self.next_kid = self.next_order = 0
+         self.outbox: list[int] = []
+         self.idle = True
+@@ -502,7 +508,9 @@ class MultiDecoder:
+                             "filling": sum(not l.decoding for l in lanes),
+                             "paused": sum(l.decoding and l.paused for l in lanes)},
+                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
+-                "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {}),
++                "kept_prompts": len(self.kept),
++                **({"multi_prefill": dict(self.grouped)} if self.group
++                   else {"mixed_chunk": self.grouped["mixed"]}),
+                 **({"fill_credit_seconds": dict(self.time_credit.seconds)} if self.time_credit is not None else {}),
+                 **({"lanes": self._class_counts(lanes), "arbiter": dict(self.arbiter.counts)}
+                    if self.arbiter is not None else {}),
+@@ -1417,8 +1425,9 @@ class MultiDecoder:
+         prof = self.profile = self.profiles[False] if self.profiles is not None else None
+         if prof is not None:
+             prof.begin(t_begin)
+-        self._round(active, lone=False)
++        self._round(active, lone=False, eager=self.mixed_eager)   # 0908: eager under TF_GLM_MIXED_CHUNK=eager
+         self._service_end(service_started, fill=False)
++        self.grouped["mixed"] += 1
+         if group is None:
+             if prof is not None:
+                 prof.fill(time.perf_counter() - t)
+@@ -1707,9 +1716,13 @@ class MultiDecoder:
+         return firsts
+ 
+     @torch.no_grad()
+-    def _round(self, lanes: list[Lane], depths: list[int] | None = None, lone: bool = False) -> None:
++    def _round(self, lanes: list[Lane], depths: list[int] | None = None, lone: bool = False,
++               eager: bool = False) -> None:
+         """Both ranks: one decode round over ``lanes`` (``depths``: rank 0's, checked on rank 1); ``lone``: one
+-        stream at home, verified through the one-stream graphs when its window fits them."""
++        stream at home, verified through the one-stream graphs when its window fits them. ``eager`` (0908,
++        MFILLR-E): the window never replays a captured graph — it runs the eager verify branch (the same calls
++        the graph body wraps, so the same bits) and skips the pad-to-captured-width, so its launches queue
++        directly behind the caller's (a mixed iteration runs it right after the chunk's MoE passes)."""
+ 
+         from .decode import copy_room
+         from .dflash2_multi import DraftRequest
+@@ -1756,11 +1769,21 @@ class MultiDecoder:
+                 raise RuntimeError(f"rank {self.rank}: a lone round's stream is not at the graphs' home")
+             if len(segments[0].tokens) <= self.lone_rows:
+                 verify = self.solo_verify
+-        # TF_GLM_MULTI_GRAPH_STEP (wide.py): a batched window between two captured widths padded to the next one
+-        pads = self._pad(segments, lanes) if verify is self.verify else []
++        # TF_GLM_MULTI_GRAPH_STEP (wide.py): a batched window between two captured widths padded to the next one.
++        # 0908: never under ``eager`` — an eager window needs no captured width (and padding rows would be
++        # extra rows the sampler then trims: work without a purpose)
++        pads = self._pad(segments, lanes) if verify is self.verify and not eager else []
++        if eager and verify is self.verify:
++            if not isinstance(verify, BatchedVerify) or not verify.widths:
++                raise RuntimeError(f"rank {self.rank}: an eager mixed round needs the batched verify (graphs)")
++            verify.eager = True                   # the window runs compute() directly (verify.forward's branch)
+         if prof is not None:
+             prof.gpu_start()
+-        v = forward_streams(verify, segments)
++        try:
++            v = forward_streams(verify, segments)
++        finally:
++            if eager and verify is self.verify:
++                verify.eager = False              # restored before anything else can take this verify
+         if prof is not None:
+             prof.gpu_stop()
+             prof.mark("verify")
+@@ -2067,7 +2090,7 @@ class MultiDecoder:
+                     first = self._fill(lane, pair[1])
+                     if first is not None:
+                         lane.s.take([first], self._ends(lane))
+-                self._round([self.lanes[sid] for sid in sids], depths, lone=False)
++                self._round([self.lanes[sid] for sid in sids], depths, lone=False, eager=self.mixed_eager)
+             elif op == ROUND:
+                 n = p[0]
+                 sids, depths = p[1:1 + 2 * n:2], p[2:2 + 2 * n:2]
+diff --git a/src/tensorfold/families/glm5_next/cuda/verify.py b/src/tensorfold/families/glm5_next/cuda/verify.py
+index ee36bd8..7a6e885 100644
+--- tensorfold/families/glm5_next/cuda/verify.py
++++ tensorfold/families/glm5_next/cuda/verify.py
+@@ -117,6 +117,10 @@ class BatchedVerify:
+         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
+         self.pgraphs: dict[int, torch.cuda.CUDAGraph] = {}    # TF_GLM_SEGPROF (segprof): the profiled graphs
+         self.replays = {"graph": 0, "eager": 0}
++        # patch 0908 (MFILLR-E): a mixed iteration's window runs eager (never a graph replay), so its expert
++        # launches queue directly behind the prompt chunk's on the stream and the routed experts' trellis is
++        # still L2-resident; multi sets this around its round and restores it (default False: as before)
++        self.eager = False
+         self.widths: list[int] = []                 # the captured widths (``wide.widths``), ascending
+ 
+     def width(self, R: int) -> int | None:
+@@ -267,7 +271,7 @@ class BatchedVerify:
+         self.seg_rows.set(spans, sparse_from=SPARSE_FROM if index else None)
+         self._tables(segments)
+         self.segments, self.R = list(segments), R
+-        g = self.graphs.get(R)
++        g = None if self.eager else self.graphs.get(R)    # 0908: a mixed iteration's window is never a replay
+         from . import segprof
+ 
+         sp = segprof.ACTIVE

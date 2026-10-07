@@ -1,0 +1,92 @@
+0903-decode-wait-budget.patch: TensorFold v0.6.5 port.
+Origin: this recipe's first in-house scheduling patch (tb default #1197).
+Port: written against TF v0.6.5 + the 86-patch release series + 0900 + 0901 (the x2 tree);
+single file: families/glm5_next/cuda/multi.py. See p1-design.md for the map.
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -153,6 +153,28 @@
+     return value
+ 
+ 
++def decode_wait_ms(value: str | None = None) -> int:
++    """TF_GLM_DECODE_WAIT_MS: when streams decode, a fill yields to a decode round after this many milliseconds
++    since the last one (0: off, the default). TF_GLM_DECODE_WAIT_MAX_ROUNDS: at most this many decode rounds in a
++    row come from the budget before a filling stream's chunk goes (fills cannot starve)."""
++
++    value = os.environ.get("TF_GLM_DECODE_WAIT_MS", "") if value is None else value
++    try:
++        ms = int(value.strip() or "0")
++    except ValueError:
++        ms = -1
++    if ms < 0:
++        raise ValueError(f"TF_GLM_DECODE_WAIT_MS: whole milliseconds >= 0 (0: off), not {value!r}")
++    return ms
++
++
++def decode_wait_max_rounds(value: str | None = None) -> int:
++    value = (os.environ.get("TF_GLM_DECODE_WAIT_MAX_ROUNDS", "2") if value is None else value).strip() or "2"
++    if not value.isdecimal() or not 1 <= int(value) <= 1000:
++        raise ValueError(f"TF_GLM_DECODE_WAIT_MAX_ROUNDS: 1 to 1000 rounds, not {value!r}")
++    return int(value)
++
++
+ def _ids_array(c) -> np.ndarray:
+     """A kept prompt's ids as an int64 array, made once and kept on the snapshot (its ids never change)."""
+ 
+@@ -398,6 +420,12 @@
+         self.share = fill_share()
+         self.credit = 0.0
+         self.time_credit = prio.TimeCredit(self.share) if fill_credit() == "time" else None
++        self._decode_wait_ms = decode_wait_ms()          # 0: off, every added path below skips
++        self._decode_wait_max_rounds = decode_wait_max_rounds() if self._decode_wait_ms else 0
++        self._last_decode = None                         # rank 0's clock at the last decode round
++        self._decode_rounds = 0                          # consecutive decode rounds taken by the budget
++        if self._decode_wait_ms and self.rank == 0:
++            print(f"[tensorfold] decode-wait budget: {self._decode_wait_ms} ms (TF_GLM_DECODE_WAIT_MS)", flush=True)
+         # patch 0141: priority lanes (cuda.priority; TENSORFOLD_PRIORITY=0: the order as before). Rank 0 decides with
+         # them; rank 1 applies rank 0's messages, so they never reach a request's arithmetic
+         self.clock = time.monotonic                      # the rules' clock (tests drive a simulated one)
+@@ -1241,6 +1269,14 @@
+         if self.fill_budget and self.decode_due:
+             self.decode_due = False
+             return None
++        if self._decode_wait_ms and decoding:
++            waited_ms = (self.clock() - self._last_decode) * 1000 if self._last_decode is not None else None
++            if waited_ms is None or waited_ms > self._decode_wait_ms:
++                if self._decode_rounds >= self._decode_wait_max_rounds:
++                    self._decode_rounds = 0         # cap reached: the next chunk goes, fills cannot starve
++                else:
++                    self._decode_rounds += 1
++                    return None                 # the budget is spent: a decode round this iteration
+         if self.partial is not None:
+             return self.partial.group[0][0]
+         if self.arbiter is not None:
+@@ -1328,6 +1364,8 @@
+                                                   many=group is not None)
+             return self._part_iteration()
+         service_started = self._service_start()
++        if self._decode_wait_ms:
++            self._decode_rounds = 0          # a chunk goes now: the budget's consecutive-round count restarts
+         if group is not None:
+             t = time.perf_counter()
+             rows = sum(stop - l.st.pos for l, stop in group)
+@@ -1401,6 +1439,9 @@
+             prof.mark("message")
+         self._round(active, lone=lone, short=short)
+         self._service_end(service_started, fill=False)
++        if self._decode_wait_ms:
++            self._last_decode = self.clock()
++            self._decode_rounds = 0
+         if self.arbiter is not None:
+             self.arbiter.rounded()
+             if len(lanes) == everyone and self._round_cap().settled():     # every stream had its round
+@@ -1939,6 +1980,9 @@
+             self._finish(lane.sid)
+         if not self.lanes and not self.idle and self.broken is None:
+             self.decode_due = self.short_round_due = False
++            if self._decode_wait_ms:
++                self._last_decode = None
++                self._decode_rounds = 0
+             self._emit(IDLE, [])
+             self._flush()
+             self.idle = True

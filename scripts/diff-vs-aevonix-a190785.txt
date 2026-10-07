@@ -1,0 +1,44 @@
+3
+a19078566298f8c51d9dbb317f20efd51fe564df Sun Oct 4 16:34:45 2026 -0400
+35c35
+< IMAGE="${IMAGE:-tensorfold-glm53:1.1.0}"
+---
+> IMAGE="${IMAGE:-tensorfold-glm53:1.1.0-x9}"
+---local.sh in aevonix?
+scripts/local.sh.example
+27,28c27,28
+< mapfile -t patches < <(cd "$repo_dir" && printf '%s\n' patches/{miaai-lab,aevonix}/*.patch | sort -t / -k3,3)
+< [[ ${#patches[@]} == 86 ]] || fail 'expected exactly 86 release patches'
+---
+> mapfile -t patches < <(cd "$repo_dir" && printf '%s\n' patches/{miaai-lab,aevonix,extra}/*.patch | sort -t / -k3,3)
+> [[ ${#patches[@]} == 88 ]] || fail 'expected exactly 88 patches (86 release + 2 extra)'
+67a68,74
+>   # A patch may carry a "# root-relative" marker: it is applied from the target root instead of
+>   # patch_dir (used for series additions that also touch tests/, which live beside src/).
+>   if head -1 "$repo_dir/$p" | grep -q '^# root-relative'; then
+>     work_dir=$target
+>   else
+>     work_dir=$patch_dir
+>   fi
+72c79
+<     if ! patch -p0 --forward --batch --fuzz=0 "${options[@]}" --input="$repo_dir/$p" >"$log" 2>&1; then
+---
+>     if ! (cd -- "$work_dir" && patch -p0 --forward --batch --fuzz=0 --no-backup-if-mismatch "${options[@]}" --input="$repo_dir/$p") >"$log" 2>&1; then
+76c83,85
+<     if grep -Eiq '\b(fuzz|offset)\b' "$log"; then
+---
+>     # extra/ patches (x1): a pure line offset is accepted (content matched, --fuzz=0 still enforced); fuzz never is
+>     if [[ "$p" == patches/extra/* ]]; then pat='\b(fuzz)\b'; else pat='\b(fuzz|offset)\b'; fi
+>     if grep -Eiq "$pat" "$log"; then
+83c92
+< printf 'Applied %s patches to TensorFold v0.6.5 successfully (no fuzz, offsets, .rej or .orig).\n' "${#patches[@]}"
+---
+> printf 'Applied %s patches (86 release + extra) to TensorFold v0.6.5 successfully (no fuzz, offsets, .rej or .orig).\n' "${#patches[@]}"
+40c40
+<   (( ${#PATCHES[@]} == 86 )) || fail E_PATCHES 'The release requires exactly 86 patches.'
+---
+>   (( ${#PATCHES[@]} == 88 )) || fail E_PATCHES 'The x1 build requires exactly 88 patches (86 release + 1 extra).'
+116c116
+<   log "Build $IMAGE: clone TensorFold $TF_VERSION at $TF_COMMIT, apply 86 patches, install runtime."
+---
+>   log "Build $IMAGE: clone TensorFold $TF_VERSION at $TF_COMMIT, apply 88 patches (86 release + 2 extra), install runtime."
