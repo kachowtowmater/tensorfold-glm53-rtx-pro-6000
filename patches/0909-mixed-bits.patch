@@ -1,0 +1,92 @@
+--- tensorfold/families/glm5_next/__init__.py.orig
++++ tensorfold/families/glm5_next/__init__.py
+@@ -44,12 +44,23 @@
+         raise ValueError("tensorfold_activation_dtype float32 is the Mac engine; the CUDA engine stays bf16")
+     method = quant_method(config)
+     if method == "exl3":
+-        # the CUDA engine's layout; the Mac engine refuses it before this through QUANT_METHODS (require_readable)
++        # the CUDA engine's layout; the Mac engine refuses it before this through QUANT_METHODS (require_readable).
++        # bits may be one width (3/4/5) or a mixed per-tensor encode ("mixed_..." / "mixed"): routed experts then load
++        # through the universal EXL3 route, which infers each tensor's width from its trellis shape (K2 = last//8).
+         found = config.get("quantization_config") or config.get("quantization") or {}
+         got = {k: found.get(k) for k in EXL3_VARIANT}
+-        if {k: (int(v) if k == "bits" and v is not None else v) for k, v in got.items()} != EXL3_VARIANT:
+-            raise ValueError(f"GLM-5.3-Flash's CUDA engine reads EXL3 checkpoints with 4-bit mcg-codebook routed "
+-                             f"experts and BF16 elsewhere ({MODELS[1]}); this one has "
++        if isinstance(got.get("bits"), str) and got["bits"].startswith("mixed"):
++            got["bits"] = "mixed"
++        got_bits = got.get("bits")
++        ok_bits = got_bits == "mixed" or (isinstance(got_bits, (int, str)) and str(got_bits).isdigit()
++                                          and int(got_bits) in (3, 4, 5))
++        wanted = {**EXL3_VARIANT, "bits": ("mixed" if got_bits == "mixed" else
++                                           (int(got_bits) if ok_bits else EXL3_VARIANT["bits"]))}
++        if not ok_bits or {k: (int(v) if k == "bits" and v is not None and v != "mixed" else v)
++                           for k, v in got.items()} != wanted:
++            raise ValueError(f"GLM-5.3-Flash's CUDA engine reads EXL3 checkpoints with 3/4/5-bit mcg-codebook routed "
++                             f"experts (one width, or a mixed per-tensor encode on the universal route) and BF16 "
++                             f"elsewhere ({MODELS[1]}); this one has "
+                              + ", ".join(f"{k} {v}" for k, v in got.items()) + f". {OWN_MODEL_HELP}")
+         print("[tensorfold] EXL3 support is experimental: replies are exact, but the MLX checkpoint "
+               f"({MODELS[0]}) is tested more and runs faster (docs/recipes/glm-5.3-flash.md)", flush=True)
+--- tensorfold/families/glm5_next/cuda/weights.py.orig
++++ tensorfold/families/glm5_next/cuda/weights.py
+@@ -22,14 +22,23 @@
+ PREFIX = "model.language_model."
+ 
+ 
+-def bits_of(quant: dict) -> int:
+-    """The checkpoint's one bit width; a mixed-bit encode (bits such as "mixed_k34_per_tensor") is refused by name."""
++MIXED_BITS = "mixed"                     # sentinel: a mixed per-tensor EXL3 encode (3/4/5-bit routed experts)
++
++
++def bits_of(quant: dict) -> int | str:
++    """The checkpoint's bit width: one int (3/4/5) or the MIXED_BITS sentinel for a mixed per-tensor encode.
+ 
++    A mixed encode's routed experts load through the universal EXL3 route, which infers each tensor's width
++    from its trellis shape (``K2 = last//8``); the GLM-only 4-bit kernels stay out of its way by construction.
++    """
++
+     bits = quant.get("bits", 4)
+     if isinstance(bits, int) or (isinstance(bits, str) and bits.isdigit()):
+         return int(bits)
+-    raise ValueError(f"this checkpoint's quantization bits are {bits!r}: GLM-5.3 on CUDA reads one bit width a "
+-                     "checkpoint, so mixed-bit EXL3 encodes are not supported yet")
++    if isinstance(bits, str) and bits.startswith("mixed"):
++        return MIXED_BITS
++    raise ValueError(f"this checkpoint's quantization bits are {bits!r}: GLM-5.3 on CUDA reads one bit width "
++                     "(3, 4 or 5), or a mixed per-tensor EXL3 encode named like \"mixed_k34_per_tensor\"")
+ 
+ 
+ @dataclass
+@@ -67,7 +76,7 @@
+     eos: tuple[int, ...]
+     mtp_layers: int
+     group_size: int
+-    bits: int
++    bits: int | str           # one width (3/4/5), or "mixed" (MIXED_BITS) for a mixed per-tensor EXL3 encode
+     quant: str = "mlx"         # "mlx" (affine 4-bit everywhere) or "exl3" (EXL3 routed experts, BF16 elsewhere)
+     codebook: str = "mcg"      # EXL3: the trellis codebook (quantization_config.codebook: 3inst, mcg or mul1)
+ 
+--- tensorfold/families/glm5_next/config.py.orig
++++ tensorfold/families/glm5_next/config.py
+@@ -37,13 +37,17 @@
+ GROUPS = (32, 64, 128)
+ 
+ 
+-def quant_formats(config: dict[str, Any]) -> tuple[tuple[int, int, str], dict[str, tuple[int, int, str] | None]]:
+-    """The checkpoint's (bits, group size, mode) and its per-module entries by config key (None: left unquantized)."""
++def quant_formats(config: dict[str, Any]) -> tuple[tuple[int, int, str], dict[str, tuple[int, int, str]] | None]:
++    """The checkpoint's (bits, group size, mode) and its per-module entries by config key (None: left unquantized).
++    A mixed per-tensor EXL3 encode (bits like "mixed_k34_per_tensor") reads as no default here: the CUDA engine's
++    routed experts infer their widths per tensor, and the BF16 modules sit outside the quantization block."""
+ 
+     from tensorfold.families import _quantization_block, layer_quantization
+ 
+     block = _quantization_block(config) or {}
+-    default = (int(block.get("bits") or 0), int(block.get("group_size") or 0), str(block.get("mode") or "affine"))
++    bits = block.get("bits")
++    default = ((int(bits) if str(bits or "").isdigit() else 0), int(block.get("group_size") or 0),
++               str(block.get("mode") or "affine"))
+     return default, {**layer_quantization(config), **{key: None for key, value in block.items() if value is False}}
+ 
+ 

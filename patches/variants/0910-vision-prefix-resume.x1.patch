@@ -1,0 +1,234 @@
+diff --git tensorfold/cli.py tensorfold/cli.py
+index 0f53610..18dddcf 100644
+--- tensorfold/cli.py
++++ tensorfold/cli.py
+@@ -317,6 +317,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
+     prompts = "FP8 activations" if fp8 else "the checkpoint math" if own else "bf16 activations"
+     print(f"[tensorfold] serving {served} at http://{args.host}:{args.port}/v1 on CUDA{where} "
+           f"(sampling: {shown}; drafts: {'off' if args.no_drafts else 'on'}; prompts: {prompts}; "
++          f"vision_prefix: {'on' if getattr(engine, 'vision_prefix', False) else 'off'}; "
+           f"context: {'unlimited' if effective_context is None else effective_context}; "
+           f"loaded in {time.perf_counter() - started:.1f}s)", flush=True)
+     app.auth = getattr(args, "auth", None)
+diff --git tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+index 7732e79..d575704 100644
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -155,6 +155,20 @@ def shared_prefix(value: str | None = None) -> int:
+     return int(value)
+ 
+ 
++def vision_prefix(value: str | None = None) -> bool:
++    """TF_GLM_VISION_PREFIX=1: an image prompt resumes its kept text prefix too, capped at its first image row
++    (patch 0910). Off (the default), a request carrying images never resumes and reports cache_reason "vision"; on,
++    the longest kept prefix strictly shorter than the first image position (``positions[0]``) is adopted and the rows
++    from there, image ones included, prefill as before."""
++
++    value = (os.environ.get("TF_GLM_VISION_PREFIX", "") if value is None else value).strip().lower()
++    if value in ("", "0", "off"):
++        return False
++    if value in ("1", "on", "true"):
++        return True
++    raise ValueError(f"TF_GLM_VISION_PREFIX: 0 (off) or 1 (on), not {value!r}")
++
++
+ def common_prefix(a, b) -> int:
+     """How many leading tokens two id sequences (lists or int64 arrays) share."""
+ 
+@@ -566,6 +580,9 @@ class GlmEngine:
+         # TF_GLM_SHARED_PREFIX: kept states where prompts stop sharing, and saved states keep DFlash2's window; rank 0
+         # picks the points (the header carries them), but both ranks save and evict alike, so both must agree
+         self.shared = shared_prefix()
++        # TF_GLM_VISION_PREFIX (patch 0910): an image prompt may resume its kept text prefix, capped at its first
++        # image row; both ranks must decide alike, so both read it
++        self.vision_prefix = vision_prefix()
+         vision = bool(vision) and rank == 0
+         workspace = vision_workspace() if vision else 0
+         if vision:                           # the tower's bf16 weights, which the split rule drops
+@@ -1055,15 +1072,18 @@ class GlmEngine:
+         dflash = (auto or code[0] // 10 == 1) and self.drafter is not None
+         return auto, auto or not dflash, dflash
+ 
+-    def _resume(self, prompt: list[int], code: list[int]):
++    def _resume(self, prompt: list[int], code: list[int], cap: int | None = None):
+         """The longest snapshot of a strict prefix of ``prompt`` whose draft caches fit the request's drafters, or of
+-        the whole prompt when it kept its head's logits row (a replay of an earlier prompt, ``decode.whole``)."""
++        the whole prompt when it kept its head's logits row (a replay of an earlier prompt, ``decode.whole``).
++        ``cap`` (patch 0910): when set, only snapshots of at most ``cap`` tokens count — an image prompt's kept text
++        prefix stops at its first image row, whose KV rows no text snapshot holds."""
+ 
+         _, mtp, dflash = self._drafters(code)
+         best = None
+         for snap in self.cache:
+             fits = (not dflash or snap.drafter_end == len(snap.ids)) and (not mtp or snap.mtp_len >= 0)
+             fits = fits and not (self.grid and len(snap.ids) % self.grid)     # prompt chunks start on the grid
++            fits = fits and (cap is None or len(snap.ids) <= cap)             # the cap never admits a longer one
+             short = len(snap.ids) < len(prompt) or (len(snap.ids) == len(prompt) and snap.head is not None)
+             if fits and short and prompt[:len(snap.ids)] == snap.ids and (
+                     best is None or len(snap.ids) > len(best.ids)):
+@@ -1190,6 +1210,9 @@ class GlmEngine:
+         stats: dict[str, Any] = {"shared": list(stops)} if stops else {}
+         if point is not None and point < len(prompt):
+             stops.append(point)
++        if feed is not None and draft and self.vision_prefix and positions and cut < positions[0] \
++                and self.grid and positions[0] % self.grid == 0:
++            stops = [positions[0]]                       # the text prefix's state is kept for the next turn
+         resume, kept = hit, []
+         for stop in stops:
+             head = list(prompt[:stop])
+@@ -1314,7 +1337,13 @@ class GlmEngine:
+                 raise ValueError(f"the tower gave {rows.shape[0]} rows for {len(positions)} image positions")
+             feed = VisionFeed(self, positions, rows)
+             feed.encode_s = time.perf_counter() - t
+-        hit = self._resume(list(prompt), code) if draft and feed is None else None
++        hit = None
++        cap = positions[0] if feed is not None and draft and self.vision_prefix and positions else None
++        if draft:
++            # patch 0910: an image prompt resumes its text prefix too (TF_GLM_VISION_PREFIX), capped at its first
++            # image row: the kept prefix must stop strictly before it, so no image row is ever adopted from a cache
++            if feed is None or cap:
++                hit = self._resume(list(prompt), code, cap)
+         shared = self._shared(list(prompt), hit) if draft and feed is None else []
+         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
+         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
+diff --git tensorfold/families/glm5_next/cuda/multi.py tensorfold/families/glm5_next/cuda/multi.py
+index f994e5e..3eff8d1 100644
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -369,7 +369,7 @@ class MultiDecoder:
+         """``drafts``: the multi-stream drafter (``dflash2_multi.MultiDrafter``; default one over the engine's
+         drafter, its graphs captured unless TF_GLM_MULTI_DRAFT_GRAPHS=0); ``verify``: the verify seam (default
+         ``SerialVerify``)."""
+-        from .engine import DFLASH_POLICY, encode_policy
++        from .engine import DFLASH_POLICY, encode_policy, vision_prefix
+ 
+         self.g = engine
+         self.e = e = engine.e
+@@ -456,6 +456,9 @@ class MultiDecoder:
+         self.cache_reasons = os.environ.get("TF_GLM_CACHE_REASONS", "0").strip() == "1"
+         self.evicted_prefixes: list[tuple[int, bytes]] = []  # bounded fingerprints, never token text in logs
+         self.burst = os.environ.get("TF_GLM_BURST_PREFIX", "0").strip() == "1"
++        # TF_GLM_VISION_PREFIX (patch 0910): an image prompt may resume its kept text prefix, capped at its first
++        # image row; rank 0 decides and rank 1 applies the same ADMIT, so both read it (engine.vision_prefix)
++        self.vision_prefix = vision_prefix()
+         self.burst_wait: dict[int, tuple[int, int]] = {}     # consumer -> (producer, grid point), rank 0 only
+         self.next_sid = self.next_kid = self.next_order = 0
+         self.outbox: list[int] = []
+@@ -701,10 +704,22 @@ class MultiDecoder:
+         slot = next((k for k in range(self.count) if k not in {l.slot for l in self.lanes.values()}), None)
+         if slot is None:
+             raise NoRoom(f"every one of the {self.count} stream slots is taken")
+-        hit = self._resume(prompt) if draft and feed is None else None
++        hit = None
++        cap = positions[0] if feed is not None and draft and self.vision_prefix and positions else None
++        if draft:
++            # patch 0910: an image prompt resumes its text prefix too (TF_GLM_VISION_PREFIX), capped at its first
++            # image row: the kept prefix must stop strictly before it, so no image row is ever adopted from a cache
++            if feed is None or cap:
++                hit = self._resume(prompt, cap)
+         if self.cache_reasons:
+-            s.cache_reason = ("hit" if hit is not None else "vision" if feed is not None else
+-                              "reuse_disabled" if not draft else self._cache_miss(prompt))
++            if hit is not None:
++                s.cache_reason = "hit"
++            elif feed is not None:
++                s.cache_reason = "vision_prefix" if cap else "vision"
++            elif not draft:
++                s.cache_reason = "reuse_disabled"
++            else:
++                s.cache_reason = self._cache_miss(prompt)
+         need = self._need(len(prompt))
+         # placement: take a kept extent over in place, or copy its rows into a new one while a stream writes in it
+         copy = 0
+@@ -739,7 +754,7 @@ class MultiDecoder:
+         sid = self.next_sid
+         payload = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
+                    int(draft), *pack_sampling(s.sampling), *(shared + [0] * SHARED_SLOTS)[:SHARED_SLOTS], *code,
+-                   *pack_prompt(prompt, hit if incremental and feed is None else None)]
++                   *pack_prompt(prompt, hit if incremental and (feed is None or cap) else None)]
+         from tensorfold.engine.grammar import pack
+ 
+         packed = pack(s.constraint)
+@@ -814,6 +829,14 @@ class MultiDecoder:
+             lane.shared = sorted(p for p in set(a["shared"]) if lane.point is not None and cut < p < lane.point)
+             lane.stops = list(lane.shared) + ([lane.point] if lane.point is not None and lane.point < len(prompt)
+                                               else [])
++        elif a["draft"] and feed is not None and self.vision_prefix and a["positions"]:
++            # patch 0910, round 2: a feed lane keeps its text prefix too: its fill stops once at its first image
++            # row (all-text rows before it), and `_keep` makes that state a kept prompt for the conversation's
++            # later turns; its end state is still never kept (`point` stays None)
++            pos0 = a["positions"][0]
++            stop0 = pos0 - (pos0 % self.grid) if self.grid else 0   # the grid point at or before the first image row
++            if stop0 > cut:
++                lane.stops = [stop0]
+         s.started = time.perf_counter()
+         lane.t0 = s.started
+         lane.since = self.clock()
+@@ -856,12 +879,16 @@ class MultiDecoder:
+             lane.stops = sorted(set(lane.stops) | {point})
+ 
+     def _resume_lane(self, lane: Lane, hit) -> None:
+-        """Both ranks: an untouched consumer already owns its destination extent. Never overwrite a partial fill."""
++        """Both ranks: an untouched consumer already owns its destination extent. Never overwrite a partial fill.
++        Patch 0910: a feed lane may resume too, but only within its text prefix — the kept extent must end before
++        the lane's first image row, so no image row is ever adopted from a cache."""
+         from .engine import grid_point
+ 
+         cut = len(hit.ids)
+-        if (lane.decoding or lane.feed is not None or not lane.s.draft or lane.st.pos != lane.s.cached
++        feed_cut = lane.feed.positions[0] if lane.feed is not None and lane.feed.positions else None
++        if (lane.decoding or not lane.s.draft or lane.st.pos != lane.s.cached
+                 or not lane.st.pos < cut <= len(lane.s.prompt) or (self.grid and cut % self.grid)
++                or (lane.feed is not None and (feed_cut is None or cut > feed_cut))
+                 or list(lane.s.prompt[:cut]) != hit.ids
+                 or (lane.dflash and (hit.drafter_end != cut or hit.drafter_rows is None))
+                 or (cut == len(lane.s.prompt) and hit.head is None)):
+@@ -872,9 +899,10 @@ class MultiDecoder:
+             self._ctx(lane).reset()
+         self._restore(lane, hit)
+         lane.s.cached = cut
+-        lane.point = grid_point(len(lane.s.prompt), cut, self.grid)
+-        lane.stops = [p for p in lane.stops if p > cut]
+-        lane.shared = [p for p in lane.shared if p > cut]
++        if lane.feed is None:                     # a feed lane keeps no states (patch 0910: it resumed a text prefix)
++            lane.point = grid_point(len(lane.s.prompt), cut, self.grid)
++            lane.stops = [p for p in lane.stops if p > cut]
++            lane.shared = [p for p in lane.shared if p > cut]
+         if self.cache_reasons:
+             lane.s.cache_reason = "burst_hit"
+ 
+@@ -892,7 +920,10 @@ class MultiDecoder:
+             if lane is None or lane.s.done:
+                 self.burst_wait.pop(sid)
+                 continue
+-            hit = self._resume(lane.s.prompt)
++            hit = self._resume(lane.s.prompt, cap=(lane.s.vision.positions[0]
++                                                   if self.vision_prefix and lane.feed is not None
++                                                   and lane.s.vision is not None
++                                                   and lane.s.vision.positions else None))
+             if hit is not None and len(hit.ids) >= point:
+                 self._emit(RESUME, [sid, hit.kid])
+                 self._resume_lane(lane, hit)
+@@ -944,17 +975,20 @@ class MultiDecoder:
+                 return c
+         raise RuntimeError(f"rank {self.rank} holds no kept prompt {kid}")
+ 
+-    def _resume(self, prompt: list[int]):
++    def _resume(self, prompt: list[int], cap: int | None = None):
+         """The longest kept strict prefix of ``prompt``, or the whole prompt when it kept its head's logits row (a
+         replay of an earlier prompt), whose DFlash2 window came along. The prompt is compared as one int64 array
+         against each kept prompt's cached array (``_ids_array``): the same answer as comparing the id lists, without
+-        copying every kept prompt's ids for every request (32 kept prompts of 100K+ tokens cost tens of ms a request)."""
++        copying every kept prompt's ids for every request (32 kept prompts of 100K+ tokens cost tens of ms a request).
++        ``cap`` (patch 0910): when set, only kept prompts of at most ``cap`` tokens count — an image prompt's kept
++        text prefix stops at its first image row, whose KV rows no text kept prompt holds."""
+         best = None
+         arr = None
+         for c in self.kept:
+             n = len(c.ids)
+             fits = c.drafter_end == n and c.drafter_rows is not None or self.drafts is None
+             fits = fits and not (self.grid and n % self.grid)
++            fits = fits and (cap is None or n <= cap)            # the cap never admits a longer one
+             short = n < len(prompt) or (n == len(prompt) and c.head is not None)
+             if not (fits and short and (best is None or n > len(best.ids))):
+                 continue
