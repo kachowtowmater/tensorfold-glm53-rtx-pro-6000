@@ -1,4 +1,4 @@
-# mcqueen recipe on top of Aevonix defaults — default#1178, 2026-10-05 (orch-chick). Paired A/B vs defaults: 4-agent warm turn 2.9->2.5 s,
+# mcqueen recipe on top of Aevonix defaults — default#1178, 2026-10-05 (orchestrator). Paired A/B vs defaults: 4-agent warm turn 2.9->2.5 s,
 # TTFT p90 0.98->0.51 s, churn warm turn 5.8->3.1 s, decode/req +10-13%, acceptance unchanged. Rejected: DFLASH_POLICY f10 (accept 55->26%).
 export SERVED_NAME="${SERVED_NAME:-glm-5.3-flash-rtx}" PORT="${PORT:-8090}"
 export TF_GLM_MULTI_WINDOW="${TF_GLM_MULTI_WINDOW:-64}" TF_GLM_MULTI_GRAPH_STEP="${TF_GLM_MULTI_GRAPH_STEP:-4}"

@@ -1,49 +1,51 @@
 #!/usr/bin/env python3
-"""Results graphic for the README / post. Numbers from docs/RETROSPECTIVE.md and results/baseline-x9-2026-10-07.json (measured on mcqueen, 4x RTX PRO 6000, Oct 5-7 2026)."""
+"""Post image: the official TensorFold hero (ashhart/TensorFold assets/, Apache-2.0) as the top band, our measured
+results as cards below, in the same palette. Numbers: docs/RETROSPECTIVE.md, results/baseline-x9-2026-10-07.json."""
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import numpy as np, os
 
-BG="#0b0f17"; FG="#e6edf3"; MUTED="#8b949e"; GOOD="#3fb950"; BEFORE="#484f58"; ACC="#58a6ff"
-fig=plt.figure(figsize=(16,9),dpi=120,facecolor=BG)
-fig.text(0.04,0.93,"GLM-5.3-Flash on TensorFold · 4× RTX PRO 6000 (Max-Q, 250 W)",color=FG,fontsize=26,weight="bold")
-fig.text(0.04,0.885,"Agent-path gains from two days of paired A/B on one box, Oct 5–7 2026. Raw single-stream decode stayed at the Aevonix",color=MUTED,fontsize=13)
-fig.text(0.04,0.855,"recipe's number (223 prose / 433 code tok/s): under speculative decoding, expert weights are only ~18% of a step.",color=MUTED,fontsize=13)
+W,H=1600,900; BAND=290; DPI=100
+NAVY="#0b1663"; NAVY2="#070e3d"; CARD="#101c6f"; EDGE="#2a3a9c"; FG="#f5f7ff"; MUTED="#b7c0ee"; DIM="#7d88cf"
+CORAL="#ff9a7a"; VIOLET="#c08cff"; BLUE="#7cc4ff"; LIME="#9af7c0"
 
-# left: before/after bars (latency, lower is better), log scale
-ax=fig.add_axes([0.27,0.20,0.33,0.58]); ax.set_facecolor(BG)
-rows=[("Image-turn TTFT\n(28k prefix, turns 2–3)",2.87,0.12,"s"),
-      ("4 cold agents, shared 40k prefix\nTTFT (worst of 4)",12.4,3.3,"s"),
-      ("Same cold burst\nturn time",13.0,4.2,"s"),
-      ("Agent turn @ 8 concurrent\n(real traffic, SGLang → TF)",5.8,2.5,"s"),
-      ("40-conversation churn, cold TTFT\n(HC_SPLIT_MIN_ROWS 512 → 2048)",5.9,5.2,"s"),
-      ("4-agent warm turn\n(recipe defaults → tuned knobs)",2.9,2.5,"s")]
-y=range(len(rows))[::-1]
-for yi,(lab,b,a,u) in zip(y,rows):
-    ax.barh(yi+0.18,b,height=0.34,color=BEFORE); ax.barh(yi-0.18,a,height=0.34,color=GOOD)
-    ax.text(b*1.05,yi+0.18,f"{b:g} {u}",va="center",color=MUTED,fontsize=11)
-    ax.text(a*1.05,yi-0.18,f"{a:g} {u}  ({b/a:.1f}× faster)",va="center",color=GOOD,fontsize=11,weight="bold")
-ax.set_yticks(list(y)); ax.set_yticklabels([r[0] for r in rows],color=FG,fontsize=11.5)
-ax.set_xscale("log"); ax.set_xlim(0.08,60); ax.set_ylim(-0.6,len(rows)-0.4); ax.set_xlabel("seconds (log scale, lower is better)",color=MUTED)
-ax.tick_params(axis="x",colors=MUTED); [s.set_color("#30363d") for s in ax.spines.values()]
-ax.barh([-5],[0],color=BEFORE,label="before"); ax.barh([-5],[0],color=GOOD,label="after")
-ax.legend(loc="lower right",frameon=False,labelcolor=FG)
+# ---- cards (matplotlib) ----
+fig=plt.figure(figsize=(W/DPI,(H-BAND)/DPI),dpi=DPI)
+ax=fig.add_axes([0,0,1,1]); ax.set_xlim(0,W); ax.set_ylim(0,H-BAND); ax.axis("off")
+g=np.linspace(0,1,256).reshape(-1,1)
+ax.imshow(g,extent=[0,W,0,H-BAND],aspect="auto",cmap=matplotlib.colors.LinearSegmentedColormap.from_list("bg",[NAVY2,NAVY]),zorder=0)
+def text(x,y,s,size,color=FG,weight="normal",ha="left",va="center"): ax.text(x,y,s,fontsize=size,color=color,weight=weight,ha=ha,va=va,zorder=5)
+def card(x,y,w,h,label,after,before,note,accent):
+    ax.add_patch(FancyBboxPatch((x,y),w,h,boxstyle="round,pad=0,rounding_size=14",fc=CARD,ec=EDGE,lw=1.2,zorder=2))
+    ax.add_patch(FancyBboxPatch((x,y+12),5,h-24,boxstyle="round,pad=0,rounding_size=2.5",fc=accent,ec="none",zorder=3))
+    text(x+26,y+h-22,label,13,MUTED)
+    text(x+26,y+h-57,after,26,accent,weight="bold")
+    text(x+26,y+28,before,11.5,DIM)
+    text(x+26,y+12,note,11.5,MUTED)
+cw,ch,gx,gy=732,112,20,12; x0=58; y_top=(H-BAND)-64
+text(58,(H-BAND)-32,"GLM-5.3-Flash on 4× RTX PRO 6000 — the agent-path overlay",21,FG,weight="bold")
+text(W-58,(H-BAND)-32,"before → after, same box, same prompts",13,MUTED,ha="right")
+cards=[
+ ("Image-turn TTFT (28k-token prefix)","2.87 s → 0.12 s","before: whole prefix re-prefilled every turn","vision-prefix resume patch (ours) · 24× faster",LIME),
+ ("4 cold agents, shared 40k prefix","12.4 s → 3.3 s","before: 6.3–12.4 s TTFT per agent","burst-prefix sharing · turn 13 s → 4.2 s",LIME),
+ ("Agent turn @ 8 concurrent, real traffic","5.8 s → 2.5 s","old SGLang serve → TensorFold, same clients","2.3× faster",LIME),
+ ("top_k = -1 / top_p 1.0 decode","24 → 188 tok/s","before: CPU sampler collapse","commdata2338 engine patch · 7.8×",LIME),
+ ("Cache evictions per 1,000 agent requests","40 → 0","CACHE_ENTRIES 64 → 128","4-agent warm turn 2.9 → 2.5 s · churn 5.8 → 3.1 s",LIME),
+ ("Cold TTFT, 40-conversation churn","5.9 s → 5.2 s","HC_SPLIT_MIN_ROWS 512 → 2048","small fills skip the 4-rank split · every cell",LIME),
+ ("Raw single-stream decode (prose / code)","223 / 433 tok/s","unchanged = the Aevonix recipe's number","expert weights are ~18% of a spec-decode step",CORAL),
+ ("Quality on our own harness","gsm8k 96.5%","1273 / 1319 full set · CJK clean","top-k 8→6 kept quality, gained 0% → requant parked",BLUE),
+]
+for i,(lab,aft,bef,note,acc) in enumerate(cards):
+    r,c=divmod(i,2); card(x0+c*(cw+gx), y_top-ch-r*(ch+gy), cw,ch,lab,aft,bef,note,acc)
+text(58,36,"Built on TensorFold (ashhart, Apache-2.0) · Aevonix 4× RTX PRO 6000 recipe · Mia-AiLab EXL3 4bpw pack · commdata2338 engine patch · incoai DFlash2 · turboderp exllamav3",11,DIM)
+text(58,16,"github.com/kachowtowmater/tensorfold-glm53-rtx-pro-6000",12.5,FG,weight="bold")
+fig.savefig("/tmp/_cards.png",dpi=DPI,facecolor=NAVY2); plt.close(fig)
 
-# right: throughput + facts
-ax2=fig.add_axes([0.66,0.20,0.32,0.58]); ax2.set_facecolor(BG); ax2.axis("off")
-facts=[("explicit top_k=-1 / top_p 1.0 decode","24 → 188 tok/s","sampler collapse fixed (commdata patch)"),
-       ("cache evictions per ~1,000 agent requests","40 → 0","CACHE_ENTRIES 128"),
-       ("prefill seconds lost to image re-prefill","80% → 0%","vision-prefix resume patch (ours)"),
-       ("gsm8k, full test set, our harness","96.5%","unchanged; 1273/1319"),
-       ("top-k 8→6 (−25% expert bytes)","0% speed","weights are ~18% of a spec-decode step"),
-       ("mixed-width EXL3 requant","≈ +3% projected","parked: not worth a 12 h window")]
-yy=0.97
-for k,v,n in facts:
-    ax2.text(0.0,yy,k,color=MUTED,fontsize=11.5,transform=ax2.transAxes)
-    ax2.text(0.0,yy-0.055,v,color=ACC if "→" in v or "%" in v else FG,fontsize=20,weight="bold",transform=ax2.transAxes)
-    ax2.text(0.0,yy-0.095,n,color=MUTED,fontsize=10,transform=ax2.transAxes)
-    yy-=0.165
-
-fig.text(0.04,0.07,"Built on: TensorFold (ashhart, Apache-2.0) · Aevonix 4× RTX PRO 6000 recipe (86 patches) · Mia-AiLab EXL3 4bpw pack · commdata2338 engine patch · incoai DFlash2 drafter · exllamav3 (turboderp)",color=MUTED,fontsize=10.5)
-fig.text(0.04,0.04,"github.com/kachowtowmater/tensorfold-glm53-rtx-pro-6000 — patches, knobs, bench scripts, every result incl. the ones that lost",color=FG,fontsize=11)
-fig.savefig("results/results-2026-10-07.png",facecolor=BG); print("wrote results/results-2026-10-07.png")
+# ---- compose with the official hero ----
+hero=Image.open("results/assets/tensorfold-hero.png").convert("RGB")
+hw,hh=hero.size; scale=W/hw; hero=hero.resize((W,int(hh*scale)),Image.LANCZOS)
+top=max(0,(hero.size[1]-BAND)//2); band=hero.crop((0,top,W,top+BAND))
+out=Image.new("RGB",(W,H),NAVY2); out.paste(band,(0,0)); out.paste(Image.open("/tmp/_cards.png").convert("RGB"),(0,BAND))
+out.save("results/results-2026-10-07.png"); print("wrote results/results-2026-10-07.png", out.size)
