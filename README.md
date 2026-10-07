@@ -1,10 +1,12 @@
-![TensorFold](results/assets/tensorfold-hero-black.png)
+![cover](results/cover-black.png)
 
 # GLM-5.3-Flash on TensorFold, 4× RTX PRO 6000: the agent-path overlay
 
 Two custom TensorFold patches, a tuned knob file, the measurement scripts, and every result (including the ones that lost) from two days of paired A/B on one box: 4× NVIDIA RTX PRO 6000 Blackwell Max-Q (96 GB each, PCIe, 250 W cap), TensorFold v0.6.5 with the Aevonix 86-patch recipe, Mia-AiLab's EXL3 4-bpw pack, the DFlash2 drafter.
 
-![results](results/results-2026-10-07.png)
+![what improved 1/2](results/cards-1-black.png)
+
+![what improved 2/2](results/cards-2-black.png)
 
 This overlay does **not** make single-stream decode faster. It stays at the Aevonix recipe's number (223 tok/s prose, 433 code, greedy, server-side). What it changes is what coding agents feel: cold bursts, image turns, cache behaviour, and the sampler edge case that collapsed throughput. The reason raw decode is where it is: under speculative decoding each MoE layer touches ~60 distinct experts per step no matter what you do to the weights, so expert bytes are ~18% of a step; we measured that by cutting them 25% (top-k 8 → 6) and getting 0%. Details in [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md).
 
@@ -18,7 +20,7 @@ This overlay does **not** make single-stream decode faster. It stays at the Aevo
 | `scripts/local.sh` | the tuned knobs with the measurement that justified each one (see below) | in production |
 | `scripts/install-overlay.sh` | puts the patches and knobs onto a clean Aevonix recipe checkout | tested on a clean checkout |
 | `bench/` | `tfprobe2.py` (4 fixed greedy probes, server-side tok/s + accepted/drafted), `quietprobe.sh` (runs them only when the server is idle), `agentsim.py` (4 agents × 6 turns on ~58k-token repos + 40-conversation churn), `cjk_canary.py` (20 Chinese prompts, counts U+FFFD), `visionprobe.py` (3-turn image conversation) | what every number here was measured with |
-| `results/` | `baseline-x9-2026-10-07.json` (the full measured baseline with every command), the graphic and its script | |
+| `results/` | `baseline-x9-2026-10-07.json` (the full measured baseline with every command), the graphics (`cover-black.png`, `cards-1-black.png`, `cards-2-black.png`, stacked `results-black.png`) and `make_chart.py` | |
 | `rejected/` | four patches of ours that lost, with their numbers | kept on purpose |
 | `docs/` | the retrospective and the dry-run window log | |
 | `PINS.md` | every upstream this sits on, with sha and licence | |
