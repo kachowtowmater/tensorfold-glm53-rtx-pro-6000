@@ -45,7 +45,7 @@ Full baseline with every command: `baseline-x9-2026-10-07.json` (card #1223, ver
 ## 4.1 Trial and tuning rounds (10-05, cards #1177 #1178)
 | what | result | verdict |
 |---|---|---|
-| TF trial vs SGLang (2 windows) | server-side C1 code 441 vs SGLang 193 C1; real-traffic e2e 137 vs 66 @conc 1; TTFB 0.09 s vs 1.37 s | TF adopted (Charles: "TF is on the table… make it better") |
+| TF trial vs SGLang (2 windows) | server-side C1 code 441 vs SGLang 193 C1; real-traffic e2e 137 vs 66 @conc 1; TTFB 0.09 s vs 1.37 s | TF adopted (the operator: "TF is on the table… make it better") |
 | R4: MULTI_WINDOW 64 / GRAPH_STEP 4 / PREFILL_ROWS 8192 (+CE_ARENA 320) / FILL_ROWS 4096 | 4-agent warm turn 2.9→2.7 s, TTFT p90 0.98→0.52 s, churn cold 12.2→8.6 s | adopted |
 | R5: DFLASH_POLICY f10 (deeper fixed drafts) | acceptance 54%→26%, every cell worse | rejected |
 | R6: + CACHE_ENTRIES 64 | 4-agent 2.5/3.5 s, churn warm 3.1 s, agg 71 | adopted (later 128: 0 evictions / 1,077 requests) |
@@ -89,7 +89,7 @@ Full baseline with every command: `baseline-x9-2026-10-07.json` (card #1223, ver
 **The arithmetic that closed the quant line.** Per step ~9 tokens verified × top-8 ≈ 60 distinct experts per MoE layer × ~9.4 MB (4-bit) × 42 layers ≈ 24 GB read across 4 GPUs ≈ 3.7 ms of a ~20 ms step (~18%). −25% bytes (top-k 6) → −4% step, cancelled by the acceptance drop; −17% bytes (3.65 bpw mixed quant) → ≈ +3% tok/s, inside noise. Dettmers' quant advice (target 3.6–3.7 bpw, router 8-bit, lm_head ≥6, pin under-calibrated experts to 4, abort rules) is in the quant runbook for the day weights do matter (no drafter, or high concurrency).
 
 ## 4.5 What was NOT measured (and would be next)
-Where the other ~16 ms per decode step go. Panel expectation (Dan, Zheng, He): TP4 all-reduce over PCIe (~90 collectives/step, 2–9 ms) and ungraphed 9-token verify steps (~1000 eager launches ≈ 10 ms) are the prime suspects; DSA indexer/KV growth with context and sampler syncs next. Stop signal for any engine rewrite: CUDA graphs cover >85% of the step and GPU busy >85% (then only TP layout/collective fusion remains). Window P (#1240) would produce the (2k/30k/90k) × (rows 1/4/8) × (drafter on/off) table in 2 h; parked by Charles (odds of a ≥20% software lever ≈ 30%).
+Where the other ~16 ms per decode step go. Panel expectation (Dan, Zheng, He): TP4 all-reduce over PCIe (~90 collectives/step, 2–9 ms) and ungraphed 9-token verify steps (~1000 eager launches ≈ 10 ms) are the prime suspects; DSA indexer/KV growth with context and sampler syncs next. Stop signal for any engine rewrite: CUDA graphs cover >85% of the step and GPU busy >85% (then only TP layout/collective fusion remains). Window P (#1240) would produce the (2k/30k/90k) × (rows 1/4/8) × (drafter on/off) table in 2 h; parked by the operator (odds of a ≥20% software lever ≈ 30%).
 
 # 5. Lessons (the ones that generalize)
 1. **Measure the bottleneck class before buying bytes.** Two nights went to weight-size levers before a 30-minute top-k test showed weights are ~18% of the step under speculative decoding. The first window should have been the step-time breakdown.
@@ -111,7 +111,7 @@ Where the other ~16 ms per decode step go. Panel expectation (Dan, Zheng, He): T
 | drafter pipeline | `~/specforge/{venv,src@53398a8,tools/template_diff.py,split_check.py}`, harness `deliverables/1210-README-training.md`, capture `~/model-gate/capture/` | plumbing proven; real training waits for ≥10k post-v5.18 records |
 | step-time runner | `~/exl3/bench/steptime.py` (#1239) | handed in, unverified |
 | window runbook | `~/tf/window/window.sh` (#1222; hard-clock fix in progress) | DRY-tested |
-| pre-flight gate | chick `(internal task dir) 1225/preflight.sh` (13/14 PASS) | reusable |
+| pre-flight gate | the seat `(internal task dir) 1225/preflight.sh` (13/14 PASS) | reusable |
 | baseline | `baseline-x9-2026-10-07.json` (this dir) | the BEFORE half of any future table |
 | measurement scripts | mcqueen `/tmp/{tfprobe2.py,quietprobe.sh,agentsim.py,burstprobe.py,visionprobe.py}` (copy into a repo before they vanish) | working |
 
@@ -125,4 +125,4 @@ Resume path if raw speed is wanted again: run Window P (2 h, #1240) with x11 + s
 - Runbooks: `quant-runbook-2026-10-06.md`, `drafter-runbook-2026-10-06.md`.
 - Worker research: `deliverables/` (knob matrix, forks and knobs, TF gaps, port candidates, mixed-chunk and mixed-expert designs, L1 report, layer checks, drafter plan, training README).
 - Ledger rows: `../../infrastructure/loadout-ledger.md` 2026-10-05/06 (APPLIED ×4, TRIED ×1).
-- Cards: `tb default show <id>` for #1177–#1240; raw worker outputs under chick `(internal task dir) <id>/`.
+- Cards: `tb default show <id>` for #1177–#1240; raw worker outputs under the seat `(internal task dir) <id>/`.
