@@ -1,4 +1,4 @@
-# X post (copy as is; attach results/results-2026-10-07.png; link goes last)
+# X post (copy as is; attach results/cover-black.png, results/cards-1-black.png, results/cards-2-black.png in that order; link goes last)
 
 Handles, from the GitHub profiles: TensorFold author ashhart = @ashxhart · Mia-AiLab = @MiaAI_lab · turboderp = @turboderp_ · Aevonix, commdata2338, incoai list no X account (named in text).
 
@@ -25,7 +25,7 @@ Built on TensorFold by @ashxhart (Apache-2.0), the Aevonix 4× PRO 6000 recipe, 
 
 Repo: https://github.com/kachowtowmater/tensorfold-glm53-rtx-pro-6000
 
-## Short version (one tweet + image)
+## Short version (one tweet + the three images)
 
 GLM-5.3-Flash on TensorFold, 4× RTX PRO 6000: our agent-path overlay is public. Image-turn TTFT 2.87 → 0.12 s, cold 4-agent bursts 12.4 → 3.3 s, sampler collapse 24 → 188 tok/s, 0 cache evictions, 8-concurrent turns 5.8 → 2.5 s vs SGLang. Raw decode unchanged (223/433 tok/s), and we measured why: weights are ~18% of a spec-decode step. Patches, knobs, bench scripts, every result incl. the losers. Built on @ashxhart's TensorFold + the Aevonix recipe + @MiaAI_lab's pack.
 https://github.com/kachowtowmater/tensorfold-glm53-rtx-pro-6000
