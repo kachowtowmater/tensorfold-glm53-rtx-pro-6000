@@ -1,0 +1,116 @@
+{
+ "recipe": {
+  "name": "x9",
+  "image": "tensorfold-glm53:1.1.0-x9",
+  "tf_patches_label": "a6cbea24a7ecd157",
+  "model_id": "glm-5.3-flash-rtx",
+  "num_experts_per_tok": 8
+ },
+ "measured_at": "2026-10-07T08:44-08:53Z (01:44-01:53 PT), box idle, fangchen 0 conns, lss probe only",
+ "decode_prose_toks": {
+  "runs": [
+   222.3,
+   222.5,
+   223.0
+  ],
+  "mean": 222.6,
+  "prompt": "prose greedy (tfprobe2 p1)"
+ },
+ "decode_code_toks": {
+  "runs": [
+   432.3,
+   433.7,
+   432.6
+  ],
+  "mean": 432.9,
+  "prompt": "code greedy (tfprobe2 p2)"
+ },
+ "decode_structured_toks": {
+  "runs": [
+   383.2,
+   382.8,
+   383.2
+  ],
+  "mean": 383.1
+ },
+ "decode_prose_temp07_toks": {
+  "runs": [
+   235.5,
+   235.5,
+   234.8
+  ],
+  "mean": 235.3
+ },
+ "accept_prose": "222/330 (67.3%)",
+ "accept_code": "329/392 (83.9%)",
+ "accept_structured": "310/367 (84.5%)",
+ "accept_prose_temp07": "242/424 (57.1%)",
+ "agentsim_4agent_p50": 2.9,
+ "agentsim_4agent_p95": null,
+ "agentsim_4agent_note": "warm turn median 2.9 s, p90 3.8 s (script reports p90 not p95); cold first turn 27.4 s (TTFT 20.07 s on 30k-word repo); reqs=24",
+ "agentsim_churn_p50": 5.5,
+ "agentsim_churn_p95": null,
+ "agentsim_churn_note": "40-conversation churn: warm turn median 5.5 s, p90 9.8 s; cold TTFT 6.26 s; reqs=80, wall 189 s",
+ "prefill_cache_miss_pct": {
+  "by_seconds": 54.81,
+  "by_rows": 24.3,
+  "reasons": {
+   "token_mismatch": {
+    "rows": 109,
+    "seconds": 172.0
+   },
+   "hit": {
+    "rows": 378,
+    "seconds": 128.9
+   },
+   "burst_hit": {
+    "rows": 2,
+    "seconds": 13.4
+   },
+   "cold": {
+    "rows": 13,
+    "seconds": 0.6
+   }
+  },
+  "note": "cachemiss.txt basis = prefill_seconds over the last 24 h of rank0.log (not just the run): 502 rows, 314.9 s; token_mismatch 109 rows / 172.0 s = 54.8% of prefill seconds. The 24 h window mixes ~14 h of pre-x9 traffic with x9 (adopted 2026-10-06 23:05Z), so whether patch 0910 dropped the token_mismatch bucket is NOT settled by this number \u2014 that check (x9-only window) is card #1191."
+ },
+ "vram_free_gb": [
+  4.66,
+  5.81,
+  5.81,
+  5.81
+ ],
+ "gpu0_peak_temp_c": 87,
+ "gpu_peak_temp_c": [
+  87,
+  72,
+  78,
+  76
+ ],
+ "gsm8k_subset": {
+  "accuracy_pct": 96.51,
+  "correct": 1273,
+  "items": 1319,
+  "command": "python3 llm_decode_bench.py --port 8090 --model glm-5.3-flash-rtx --test-profile gsm8k --display-mode plain",
+  "note": "FULL gsm8k test set (1319) on x9, 2026-10-07 01:50 PT. Window A paired 300-item subset: x9 95.67% (287/300), top-k6 96.0% (288/300). Mia model-card 98.8 is a different harness, not comparable.",
+  "wilson95": "95.38-97.38"
+ },
+ "humaneval": null,
+ "humaneval_note": "no humaneval profile in llm_decode_bench; Mia model card 95.7% is NOT our measurement",
+ "cjk_fffd": 0,
+ "cjk_note": "20 zh prompts, temp 0. At max_tokens 200: one U+FFFD, at index 356 of 357 (last char) on a finish_reason=length reply = a multi-byte char split by the token cutoff, a client-side decode artifact, not model output; the same prompt at max_tokens 400 has 0. Mid-text U+FFFD = 0 at both 200 and 400. Script 1223/cjk_canary.py. Gate rule for AFTER: count only U+FFFD not at the end of a length-truncated reply.",
+ "commands": {
+  "cachemiss": "python3 parse of /home/mcqueen/tf/recipe-x9/logs/current/rank0.log: done lines, prefill-SECONDS basis, 24 h window (say-which: seconds)",
+  "cjk": "python3 /tmp/cjk_canary.py  (20 fixed zh prompts; counts U+FFFD in replies)",
+  "decode": "/tmp/quietprobe.sh  (drives /tmp/tfprobe2.py; server-side tok/s from rank0 done lines)",
+  "vram": "nvidia-smi --query-gpu=index,memory.free --format=csv,noheader",
+  "humaneval": "NOT AVAILABLE \u2014 llm_decode_bench has no humaneval profile; Mia modelcard 95.7% (164 greedy) is the reference",
+  "agentsim": "python3 /tmp/agentsim.py 4 6 30000 40  (args pinned from 2026-10-05.md \u00a7default#1178)",
+  "gsm8k": "python3 llm_decode_bench.py --port 8090 --model glm-5.3-flash-rtx --test-profile gsm8k --display-mode plain"
+ },
+ "noise_notes": "decode \u00b11-2% (server-side), agentsim \u00b110-15% per cell, gsm8k 300-item \u00b12.5 pts (Wilson)",
+ "raw": "~/workspaces/_tasks/default/1223/mcq-out/ (mcqueen ~/mcq/1223/out)",
+ "agentsim_4agent_p90": 3.8,
+ "agentsim_churn_p90": 9.8,
+ "agentsim_note": "agentsim.py reports median and p90 per cell (not p95); p95 keys kept null, p90 keys hold the values"
+}
