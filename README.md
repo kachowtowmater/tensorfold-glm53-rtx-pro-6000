@@ -2,14 +2,17 @@
 
 # GLM-5.3-Flash on TensorFold, 4× RTX PRO 6000: the agent-path overlay
 
-Two custom TensorFold patches, a tuned knob file, the measurement scripts, and every result (including the ones that lost) from two days of paired A/B on one box: 4× NVIDIA RTX PRO 6000 Blackwell Max-Q (96 GB each, PCIe, 250 W cap), TensorFold v0.6.5 with the Aevonix 86-patch recipe, Mia-AiLab's EXL3 4-bpw pack, the DFlash2 drafter.
+Four custom TensorFold patches, a tuned knob file, the measurement scripts, and every result (including the ones that lost) from paired A/B on one box: 4× NVIDIA RTX PRO 6000 Blackwell Max-Q (96 GB each, PCIe, 250 W cap), TensorFold v0.6.5 with the Aevonix 86-patch recipe, Mia-AiLab's EXL3 4-bpw pack, the DFlash2 drafter. Current release: **x14** (image `tensorfold-glm53:1.1.0-x14`), which adds patches 0921 and 0923 (prompt tokenization without the GIL, via fastokens) to x9.
 
 ## What you gain
 
-If you run coding agents (long prompts, tool calls, images, several at once) against this serve, this is the difference, measured on the same box with the same prompts, before → after:
+If you run coding agents (long prompts, tool calls, images, several at once) against this serve, this is the difference, measured on the same box with the same prompts, before → after. The first three rows are new in x14 and compare against x9 in the same window (unique prompts, temperature 0); the rest compare x9 against the recipe defaults or our old serve:
 
 | what | before | after | how much | where it comes from |
 |---|---|---|---|---|
+| Decode of a short request while a 400k-token cached session sends a request every 1 s (85 tokens out) | 117.9 tok/s | **151.0 tok/s** | **+28%** | patches 0921 + 0923: the long session's prompt no longer holds the GIL while it is tokenized, so the engine loop stops stalling once a second |
+| Tokenize a 400k-token prompt | 707–855 ms (HF tokenizers) | **41–44 ms**, GIL released | **16–21× faster** | patch 0923 (fastokens 0.3.2, `TF_W1_FASTOKENS=1`); token ids identical to HF tokenizers over 5,857,088 tokens |
+| Throughput at C1 code / prose / JSON, C8, C32 (tok/s) | 341.1 / 186.1 / 419.2, 695.6, 1123.5 | 339.7 / 186.8 / 416.8, 705.7, 1132.6 | unchanged (within noise) | x14 changes tokenization only |
 | Time to first token on an image turn (28k-token conversation with a picture; turns 2 and 3) | 2.87 s, every turn | **0.12 s** | **24× faster** | patch 0910: the text prefix stays cached instead of being re-prefilled |
 | Prefill seconds burned by image turns on a day of agent traffic | 80% of all prefill time | ~0 | | same patch (632 of 4,365 requests were doing this) |
 | 4 cold agents starting on the same 40k-token repo | TTFT 6.3–12.4 s each, turn ~13 s | **3.3 s each, turn 4.2 s** | **3× faster** | burst-prefix sharing (commdata2338's engine patch, optional) |
@@ -19,8 +22,9 @@ If you run coding agents (long prompts, tool calls, images, several at once) aga
 | 4-agent warm turn / TTFT p90 / churn warm turn | 2.9 s / 0.98 s / 5.8 s (recipe defaults) | **2.5 s / 0.51 s / 3.1 s** | 14–47% | window, graph step, prefill rows, cache knobs |
 | Cold TTFT under 40-conversation churn | 5.9 s | **5.2 s** | 12% | `TF_GLM_HC_SPLIT_MIN_ROWS` 512 → 2048 (small fills skip the 4-rank split) |
 | Quality (gsm8k full test set, our harness) | 96.5% | 96.5% | unchanged | nothing here touches the weights |
+| Long-context correctness on x14 | | recall 8/8 at 326k (28,500-record ledger), no repetition at 400k and 320k, 8,192-token output clean, tool call + needle at 300k pass | | |
 
-What you do **not** gain: raw single-stream decode. It stays at the Aevonix recipe's number (223 tok/s prose, 433 code, greedy, server-side). We measured why rather than guessing: under speculative decoding each MoE layer touches ~60 distinct experts per step whatever you do to the weights, so expert bytes are ~18% of a step; cutting them 25% (top-k 8 → 6) kept quality and changed speed 0%. That is why the requant is parked. Details and every table: [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md).
+What you do **not** gain: raw single-stream decode. It stays at the Aevonix recipe's number (223 tok/s prose, 433 code, greedy, server-side). We measured why rather than guessing: under speculative decoding each MoE layer touches ~60 distinct experts per step whatever you do to the weights, so expert bytes are ~18% of a step; cutting them 25% (top-k 8 → 6) kept quality and changed speed 0%. That is why the requant is parked. x14 does not change it either (C1 within ±0.6% of x9). Details and every table: [docs/RETROSPECTIVE.md](docs/RETROSPECTIVE.md); x14 numbers: `results/x14-vs-x9-2026-10-13.json`.
 
 ![what improved 1/2](results/cards-1-black.png)
 
@@ -31,13 +35,15 @@ What you do **not** gain: raw single-stream decode. It stays at the Aevonix reci
 | path | what | status |
 |---|---|---|
 | `patches/0910-vision-prefix-resume.patch` | image prompts keep and resume their text prefix in the kept-state cache instead of re-prefilling the whole conversation every turn. 3-turn image conversation, 28k prefix: turn-2/3 TTFT **2.87 s → 0.12 s** (27,968 of 28,058 tokens cached), replies and greedy probes identical. Flag `TF_GLM_VISION_PREFIX=1`. | in production |
+| `patches/0921-tokenize-no-gil.patch` | port of MiaAI-Lab patch 0099: prompts are tokenized through HF tokenizers' batch calls, which release the GIL (`encode` holds it ~1.2 µs a token). `App._encode_ids` at four server sites (prepare, `_encode` fallback, think-close, tool gate), `encode_batch_fast` / `encode_batch` in the incremental tokenizer, and `vision/glm.py`. Same ids. | in production (x14) |
+| `patches/0923-fastokens-flag.patch` | prompt encoding through fastokens 0.3.2 (Rust, GIL released, multi-threaded) behind `TF_W1_FASTOKENS=1`: new `tensorfold/cuda/fasttok.py`, used by `App._encode_ids`, the incremental tokenizer's tail (literal barriers found in the text; on any disagreement with the special-token boundaries it falls back to the HF offsets path) and `vision/glm.py`. Applies after 0921. Off = x9 + 0921 exactly. Needs `fastokens==0.3.2` in the image (the installer adds it). | in production (x14) |
 | `patches/0909-mixed-bits.patch` | lets TF load EXL3 packs whose routed experts have different bit widths per tensor (3/4/5) and makes the autotuner tune every width present. On a normal 4-bit pack it is a verified no-op (probes and tok/s identical). Needed only if you requantize with exllamav3's per-tensor recipe. | verified, idle |
 | `patches/variants/0910-…x1.patch` | the same vision-prefix patch for trees that also carry commdata2338's engine patch (see PINS.md) | in production on our box |
 | `scripts/local.sh` | the tuned knobs with the measurement that justified each one (see below) | in production |
-| `scripts/install-overlay.sh` | puts the patches and knobs onto a clean Aevonix recipe checkout | tested on a clean checkout |
-| `bench/` | `tfprobe2.py` (4 fixed greedy probes, server-side tok/s + accepted/drafted), `quietprobe.sh` (runs them only when the server is idle), `agentsim.py` (4 agents × 6 turns on ~58k-token repos + 40-conversation churn), `cjk_canary.py` (20 Chinese prompts, counts U+FFFD), `visionprobe.py` (3-turn image conversation) | what every number here was measured with |
-| `results/` | `baseline-x9-2026-10-07.json` (the full measured baseline with every command), the graphics (`cover-black.png`, `cards-1-black.png`, `cards-2-black.png`, stacked `results-black.png`) and `make_chart.py` | |
-| `rejected/` | four patches of ours that lost, with their numbers | kept on purpose |
+| `scripts/install-overlay.sh` | puts the patches and knobs onto a clean Aevonix recipe checkout, sets the image tag `1.1.0-x14` and adds `fastokens==0.3.2` to `IMAGE_EXTRAS` | tested on a clean checkout (90 patches apply, fuzz 0) and as an upgrade over an x9 install |
+| `bench/` | `tfprobe2.py` (4 fixed greedy probes, server-side tok/s + accepted/drafted), `quietprobe.sh` (runs them only when the server is idle), `agentsim.py` (4 agents × 6 turns on ~58k-token repos + 40-conversation churn), `cjk_canary.py` (20 Chinese prompts, counts U+FFFD), `visionprobe.py` (3-turn image conversation), `tok_check_x14.py` (x14 token-identity gate: fastokens vs HF tokenizers, id for id, plus the incremental tokenizer cold and warm) and `tok_check_mutation.py` (breaks 0923 two ways; the gate must go red) | what every number here was measured with |
+| `results/` | `x14-vs-x9-2026-10-13.json` (the x14 A/B), `tok-check-x14-2026-10-13.log` (identity gate: 0 mismatches over 5,857,088 tokens; mutation runs A and B red), `baseline-x9-2026-10-07.json` (the full measured x9 baseline with every command), the graphics (`cover-black.png`, `cards-1-black.png`, `cards-2-black.png`, stacked `results-black.png`) and `make_chart.py` | |
+| `rejected/` | four patches of ours that lost and the knob sweeps and rebases that lost, with their numbers | kept on purpose |
 | `docs/` | the retrospective and the dry-run window log | |
 | `PINS.md` | every upstream this sits on, with sha and licence | |
 
@@ -51,6 +57,7 @@ What you do **not** gain: raw single-stream decode. It stays at the Aevonix reci
 | `TF_GLM_CACHE_ENTRIES` | 128 | 4-agent warm turn 2.5 s / p90 3.5, churn warm turn 5.8 → 3.1 s; at 128: 0 evictions in 1,077 agent requests vs 40 before |
 | `TF_GLM_HC_SPLIT_MIN_ROWS` | 2048 (default 512) | small warm-turn fills (~1k rows) skip the 4-rank hyper-connection split: churn cold TTFT 5.9 → 5.2 s, consistent on every cell across two runs, probes identical |
 | `TF_GLM_VISION_PREFIX` | 1 | needs patch 0910; numbers above |
+| `TF_W1_FASTOKENS` | 1 | needs patches 0921 + 0923 and `fastokens==0.3.2`; long-session co-run short decode 117.9 → 151.0 tok/s, 400k-token tokenize 707–855 → 41–44 ms, C1/C8/C32 unchanged |
 | `TENSORFOLD_GPU_SAMPLE_FULL`, `TENSORFOLD_SAMPLE_SKIP_FUTILE`, `TF_GLM_BURST_PREFIX`, `TF_GLM_CACHE_REASONS` | 1 | **only with commdata2338's engine patch** (optional, see PINS.md): explicit `top_k=-1` / `top_p 1.0` decode 24 → 188 tok/s; 4 cold agents sharing a 40k prefix: TTFT 6.3–12.4 s → 3.3 s each, turn ~13 s → 4.2 s. Without that patch these variables are ignored |
 
 Power cap stays at 250 W (settled earlier: 400 W made decode slightly worse on these cards).
@@ -61,14 +68,16 @@ Hardware: 4× RTX PRO 6000 Blackwell (96 GB each; ours are Max-Q), PCIe host wit
 
 ```bash
 # 1. the Aevonix recipe at the pinned commit
+# (upstream main is now release 1.2.0; the 1.1.0 pin is off-branch, so fetch it by sha)
 git clone https://github.com/Aevonix/GLM-5.3-Flash-EXL3-4x-RTX-PRO-6000-TensorFold recipe
-cd recipe && git checkout a19078566298f8c51d9dbb317f20efd51fe564df && cd ..
+cd recipe && git fetch origin a19078566298f8c51d9dbb317f20efd51fe564df && git checkout a19078566298f8c51d9dbb317f20efd51fe564df && cd ..
 
-# 2. this overlay onto it (copies patches into patches/extra/, fixes the strict patch count, installs the knobs)
+# 2. this overlay onto it (copies 4 patches into patches/extra/, fixes the strict patch count to 90, installs the knobs,
+#    image tag 1.1.0-x14, adds fastokens==0.3.2 to IMAGE_EXTRAS)
 git clone https://github.com/kachowtowmater/tensorfold-glm53-rtx-pro-6000 overlay
 ./overlay/scripts/install-overlay.sh "$PWD/recipe"
 
-# 3. build the image: clones TensorFold v0.6.5, applies 86 + 2 patches, installs the runtime (first build ~20-40 min)
+# 3. build the image: clones TensorFold v0.6.5, applies 86 + 4 patches, installs the runtime (first build ~20-40 min)
 cd recipe && ./scripts/prepare.sh        # downloads Mia's pack (164 GB) + DFlash2 if missing; DRY_RUN=1 ./scripts/prepare.sh to see the plan
 
 # 4. serve (first start compiles the CUDA kernels and autotunes, ~10 min; cached afterwards)
@@ -82,22 +91,25 @@ python3 ../overlay/bench/cjk_canary.py                                          
 ./stop.sh
 ```
 
-Expected on our box after step 5: probes `222/330 329/392 310/367 242/424` accepted/drafted at `223 / 433 / 383 / 235` tok/s; agentsim 4-agent warm turn ~2.9 s (p90 3.8), churn warm turn ~5.5 s; agentsim cells repeat within ±10–15%, probes within ±2%. Full baseline: `results/baseline-x9-2026-10-07.json`.
+Expected on our box after step 5: probes `222/330 329/392 310/367 242/424` accepted/drafted at `223 / 433 / 383 / 235` tok/s; agentsim 4-agent warm turn ~2.9 s (p90 3.8), churn warm turn ~5.5 s; agentsim cells repeat within ±10–15%, probes within ±2%. Full baseline: `results/baseline-x9-2026-10-07.json`. x14 leaves these numbers where they are; it changes what happens when one client sends very long prompts while others decode (`results/x14-vs-x9-2026-10-13.json`). To check the tokenizer on your own texts: `python3 bench/tok_check_x14.py <model_dir> <corpus_dir> [requests.jsonl ...]` inside the image (it expects `long-400k.txt`, `needle-300k.txt` and `pg*.txt` books in the corpus dir).
 
-Optional, for the sampler fix and burst-prefix sharing: fetch commdata2338's engine patch (PINS.md), drop it in `recipe/patches/extra/0900-commdata-engine.patch`, replace `0910-…` with `patches/variants/0910-…x1.patch`, rerun `install-overlay.sh` (it recounts), rebuild. We run that in production; we do not redistribute their patch because it carries no licence.
+Optional, for the sampler fix and burst-prefix sharing: fetch commdata2338's engine patch (PINS.md), drop it in `recipe/patches/extra/0900-commdata-engine.patch`, replace `0910-…` with `patches/variants/0910-…x1.patch`, rerun `install-overlay.sh` (it recounts: 91 patches), rebuild. We run that in production; we do not redistribute their patch because it carries no licence.
+
+Upgrading an x9 install: rerun `install-overlay.sh` on the same recipe checkout. It copies 0921 and 0923, recounts to 90, switches the tag and `IMAGE_EXTRAS`, and appends `TF_W1_FASTOKENS=1` to an existing `scripts/local.sh`. Then rebuild with `./scripts/prepare.sh`.
 
 ## What did not work (short version; numbers in `rejected/README.md`)
 
-Decode-wait yields, PDL on the EXL3 decode kernel, two mixed chunk+decode schedulers, Mia's sliced fill, CUDA-IPC comms, deeper or cost-measured draft depth, bf16 KV, bigger prefill rows, more parallel streams. Top-k 8 → 6 kept quality (gsm8k 96.0 vs 95.7 on a paired 300-item subset) and changed speed 0%, which is the measurement that tells you expert bytes are not the bottleneck under speculative decoding and parked our requant plan. What we did not get to: a step-time breakdown of the other ~82% (TP4 all-reduce over PCIe and ungraphed 9-token verify steps are the suspects). If you do it first, open an issue.
+Decode-wait yields, PDL on the EXL3 decode kernel, two mixed chunk+decode schedulers, Mia's sliced fill, CUDA-IPC comms, deeper or cost-measured draft depth, bf16 KV, bigger prefill rows, more parallel streams. Top-k 8 → 6 kept quality (gsm8k 96.0 vs 95.7 on a paired 300-item subset) and changed speed 0%, which is the measurement that tells you expert bytes are not the bottleneck under speculative decoding and parked our requant plan. This week (x14): the Aevonix 1.2.0 rebase (its `MULTI_WINDOW 128` / `GRAPH_STEP 8` defaults cost the long-session co-run 24%), `MULTI_WINDOW 32` (C32 −14%), fill/prefill row and `COPY_MAX` variants (noise), indexer grid 512 + TF PR #421 (no gain on a quiet serve). And one method lesson: other users' traffic on the box during an A/B produced fake 1.2–1.9× wins; block it for the window. What we did not get to: a step-time breakdown of the other ~82% (TP4 all-reduce over PCIe and ungraphed 9-token verify steps are the suspects). If you do it first, open an issue.
 
 ## Credits
 
 - **TensorFold** by [ashhart](https://github.com/ashhart/TensorFold) (Apache-2.0): the engine, EXL3 expert kernels, DSA/KDA attention, CUDA graphs, drafter verification. Everything here is a patch on top of it.
 - **Aevonix**: the [4× RTX PRO 6000 recipe](https://github.com/Aevonix/GLM-5.3-Flash-EXL3-4x-RTX-PRO-6000-TensorFold) (TP4, FP8 KV, 1M window, 86 patches with Mia-AiLab) and the published baseline we measured against.
-- **Mia-AiLab**: the EXL3 4-bpw pack and the original DGX Spark patch series.
+- **Mia-AiLab** (MiaAI-Lab): the EXL3 4-bpw pack, the original DGX Spark patch series, and patch 0099 (tokenize without the GIL), which our 0921 ports.
 - **commdata2338**: the engine patch that fixes the sampler collapse and adds burst-prefix sharing and cache-reason logging, plus the independent 4× PRO 6000 benchmark.
+- **crusoecloud**: [fastokens](https://github.com/crusoecloud/fastokens) (Apache-2.0), the Rust tokenizer patch 0923 encodes prompts with.
 - **incoai**: the DFlash2 drafter weights. **turboderp**: exllamav3 and the EXL3 format.
 - Artwork: the TensorFold hero image is the project's own (`assets/tensorfold-hero.png` in ashhart/TensorFold, Apache-2.0); we only darkened its navy backdrop to black (`results/make_chart.py`, original kept in `results/assets/`). The results card is ours.
-- Measured and written by kachowtowmater's agent fleet (Claude Code orchestrating omp/GLM workers), Oct 5–7 2026.
+- Measured and written by kachowtowmater's agent fleet (Claude Code orchestrating omp/GLM workers), Oct 5–7 2026; x14 on Oct 13 2026.
 
 Licence: Apache-2.0 for the files in this repo (patches are derivatives of TensorFold, same licence). Weights and upstream patches are not included; see PINS.md.

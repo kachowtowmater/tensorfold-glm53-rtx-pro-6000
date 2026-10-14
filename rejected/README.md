@@ -15,4 +15,18 @@ All measured on the same box with the same scripts (`bench/`), paired against th
 | top-k 8 → 6 (`num_experts_per_tok`, config only) | −25% expert reads per token | gsm8k-300 96.0% vs 95.7% (quality held); speed 0% (228/412/397/233 vs 219/428/377/229 tok/s) | expert bytes are ~18% of a speculative decode step |
 | mixed-width EXL3 requant (3.65 bpw experts) | −17% expert bytes | projected ≈ +3% from the top-k result; pipeline proven (resume, FP8 load, 3–3.5 h convert) but not run | not worth a 12 h window on this box |
 
+## Week of 2026-10-13 (x9 → x14), knobs and rebases, no patch files
+
+Same box and scripts, paired against x9 in the same window. The co-run is a 400k-token cached session sending a request every 1 s (85 tokens out) while one short request decodes; its number is the short request's decode tok/s.
+
+| change | idea | measured | why rejected |
+|---|---|---|---|
+| Aevonix recipe 1.2.0 (TF v0.6.6) with our x9 additions rebased onto it | track upstream | same as x9 at our knobs; its new defaults `TF_GLM_MULTI_WINDOW 128` / `TF_GLM_MULTI_GRAPH_STEP 8` cost the long-session co-run **−24%** | nothing gained over x9; we stay on the 1.1.0 pin |
+| `TF_GLM_MULTI_WINDOW 32` | smaller decode window | C32 aggregate **−14%** | throughput loss at high concurrency |
+| `TF_GLM_FILL_ROWS` / `TF_GLM_PREFILL_ROWS` 2048 / 4096 variants | smaller fill and prefill chunks | within noise; FILL 2048 + PREFILL 4096 gave a small first-token gain during a cold 400k prefill | too small to justify a knob change |
+| `COPY_MAX 8` | more copy drafts | within noise | nothing to adopt |
+| indexer (seg-score) grid 512 (part of Mia 0107) + TensorFold PR #421 port (`_take_over` without a clone) | less indexer and copy work per step | no measurable gain on a quiet serve | x14 carries the tokenizer change only |
+
+**Methodology lesson.** Measuring with other users' traffic on the box produced fake 1.2–1.9× "wins" this week. Block outside traffic for the whole A/B window and run both arms inside it.
+
 Numbers and context: `docs/RETROSPECTIVE.md`.

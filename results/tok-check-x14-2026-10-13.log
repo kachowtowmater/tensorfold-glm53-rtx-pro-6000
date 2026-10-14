@@ -1,0 +1,105 @@
+# x14 identity gate (bench/tok_check_x14.py) and its mutation proof (bench/tok_check_mutation.py), 2026-10-13, CPU only, in the x14 image.
+# Corpus: a ~400k-token text, a ~300k-token needle text, 7 public-domain books, 302 generated varied texts, both long texts rendered
+# through the GLM chat template, and the 200 most recent real requests to our serve (texts stayed in the process; only counts were
+# printed; the group label here was renamed from the run's internal name to "recent-200-requests").
+# Verdict: 0 mismatches over 5,857,088 tokens; incremental tokenizer identical cold and warm (ids, literal barriers, hash state);
+# 0 fast-path fallbacks; GIL released. Mutation A and B both go red (A on the chat-rendered ids, B on the incremental barriers).
+# The mutation runs were made without the request logs, hence 3,620,449 tokens there.
+
+## tok_check_x14.py (patch 0923 as shipped) -> exit 0
+PASS TF_W1_FASTOKENS=1 -> FastEncoder loaded
+PASS TF_W1_FASTOKENS=0 -> no FastEncoder (x9 + 0921 path)
+PASS A ids  corpus-400k: 1 texts, add_special_tokens=False: 0 differ
+PASS A ids  corpus-400k: 1 texts, add_special_tokens=True: 0 differ
+PASS A ids  corpus-needle: 1 texts, add_special_tokens=False: 0 differ
+PASS A ids  corpus-needle: 1 texts, add_special_tokens=True: 0 differ
+PASS A ids  corpus-books: 7 texts, add_special_tokens=False: 0 differ
+PASS A ids  corpus-books: 7 texts, add_special_tokens=True: 0 differ
+PASS A ids  chat-rendered-corpus: 2 texts, add_special_tokens=False: 0 differ
+PASS A ids  chat-rendered-corpus: 2 texts, add_special_tokens=True: 0 differ
+PASS A ids  varied-302: 302 texts, add_special_tokens=False: 0 differ
+PASS A ids  varied-302: 302 texts, add_special_tokens=True: 0 differ
+PASS A ids  recent-200-requests-texts: 400 texts, add_special_tokens=False: 0 differ
+PASS A ids  recent-200-requests-texts: 400 texts, add_special_tokens=True: 0 differ
+PASS A ids  recent-200-requests-chat-rendered: 200 texts, add_special_tokens=False: 0 differ
+PASS A ids  recent-200-requests-chat-rendered: 200 texts, add_special_tokens=True: 0 differ
+A total tokens compared (flag False): 5,857,088
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental corpus-400k: 1 texts, 0 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 0)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental corpus-needle: 1 texts, 0 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 0)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental corpus-books: 7 texts, 0 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 0)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental chat-rendered-corpus: 2 texts, 13 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 0)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental varied-302: 302 texts, 12316 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 0)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental recent-200-requests-texts: 400 texts, 0 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 0)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental recent-200-requests-chat-rendered: 200 texts, 178361 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 0)
+PASS C App._encode_ids fast == HF, add_special_tokens=False: 302 texts, 0 differ
+PASS C App._encode_ids fast == HF, add_special_tokens=True: 302 texts, 0 differ
+D 400k text (400,000 tok): HF encode_batch(offsets, x13 incremental tail) 707 ms | HF encode_batch_fast 585 ms | fastokens 44 ms (15.9x vs offsets path) | counter during fastokens 69% of idle
+PASS D GIL released during fastokens encode (counter >= 50% of idle)
+ALL PASS
+
+## tok_check_mutation.py A (fastokens without added-token extraction on inputs >= 100k chars) -> exit 1
+PASS TF_W1_FASTOKENS=1 -> FastEncoder loaded
+PASS TF_W1_FASTOKENS=0 -> no FastEncoder (x9 + 0921 path)
+PASS A ids  corpus-400k: 1 texts, add_special_tokens=False: 0 differ
+PASS A ids  corpus-400k: 1 texts, add_special_tokens=True: 0 differ
+PASS A ids  corpus-needle: 1 texts, add_special_tokens=False: 0 differ
+PASS A ids  corpus-needle: 1 texts, add_special_tokens=True: 0 differ
+PASS A ids  corpus-books: 7 texts, add_special_tokens=False: 0 differ
+PASS A ids  corpus-books: 7 texts, add_special_tokens=True: 0 differ
+FAIL A ids  chat-rendered-corpus: 2 texts, add_special_tokens=False: 2 differ
+FAIL A ids  chat-rendered-corpus: 2 texts, add_special_tokens=True: 2 differ
+PASS A ids  varied-302: 302 texts, add_special_tokens=False: 0 differ
+PASS A ids  varied-302: 302 texts, add_special_tokens=True: 0 differ
+A total tokens compared (flag False): 3,620,449
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental corpus-400k: 1 texts, 0 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 1)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental corpus-needle: 1 texts, 0 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 1)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental corpus-books: 7 texts, 0 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 5)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental chat-rendered-corpus: 2 texts, 13 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 2)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+PASS B incremental varied-302: 302 texts, 12316 literal barriers: cold 0 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 0)
+PASS C App._encode_ids fast == HF, add_special_tokens=False: 302 texts, 0 differ
+PASS C App._encode_ids fast == HF, add_special_tokens=True: 302 texts, 0 differ
+D 400k text (400,000 tok): HF encode_batch(offsets, x13 incremental tail) 690 ms | HF encode_batch_fast 520 ms | fastokens 19 ms (36.3x vs offsets path) | counter during fastokens 78% of idle
+PASS D GIL released during fastokens encode (counter >= 50% of idle)
+2 FAIL
+
+## tok_check_mutation.py B (every literal barrier one token late) -> exit 1
+PASS TF_W1_FASTOKENS=1 -> FastEncoder loaded
+PASS TF_W1_FASTOKENS=0 -> no FastEncoder (x9 + 0921 path)
+PASS A ids  corpus-400k: 1 texts, add_special_tokens=False: 0 differ
+PASS A ids  corpus-400k: 1 texts, add_special_tokens=True: 0 differ
+PASS A ids  corpus-needle: 1 texts, add_special_tokens=False: 0 differ
+PASS A ids  corpus-needle: 1 texts, add_special_tokens=True: 0 differ
+PASS A ids  corpus-books: 7 texts, add_special_tokens=False: 0 differ
+PASS A ids  corpus-books: 7 texts, add_special_tokens=True: 0 differ
+PASS A ids  chat-rendered-corpus: 2 texts, add_special_tokens=False: 0 differ
+PASS A ids  chat-rendered-corpus: 2 texts, add_special_tokens=True: 0 differ
+PASS A ids  varied-302: 302 texts, add_special_tokens=False: 0 differ
+PASS A ids  varied-302: 302 texts, add_special_tokens=True: 0 differ
+A total tokens compared (flag False): 3,620,449
+PASS B GLM tokenizer is in the incremental 'supported' profile
+FAIL B incremental corpus-400k: 1 texts, 0 literal barriers: cold 0 differ, warm-turn 1 differ (fast-path fallbacks to HF offsets: 1)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+FAIL B incremental corpus-needle: 1 texts, 0 literal barriers: cold 0 differ, warm-turn 1 differ (fast-path fallbacks to HF offsets: 1)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+FAIL B incremental corpus-books: 7 texts, 0 literal barriers: cold 0 differ, warm-turn 7 differ (fast-path fallbacks to HF offsets: 7)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+FAIL B incremental chat-rendered-corpus: 2 texts, 13 literal barriers: cold 2 differ, warm-turn 0 differ (fast-path fallbacks to HF offsets: 0)
+PASS B GLM tokenizer is in the incremental 'supported' profile
+FAIL B incremental varied-302: 302 texts, 12316 literal barriers: cold 69 differ, warm-turn 233 differ (fast-path fallbacks to HF offsets: 233)
+PASS C App._encode_ids fast == HF, add_special_tokens=False: 302 texts, 0 differ
+PASS C App._encode_ids fast == HF, add_special_tokens=True: 302 texts, 0 differ
+D 400k text (400,000 tok): HF encode_batch(offsets, x13 incremental tail) 702 ms | HF encode_batch_fast 517 ms | fastokens 19 ms (37.6x vs offsets path) | counter during fastokens 119% of idle
+PASS D GIL released during fastokens encode (counter >= 50% of idle)
+5 FAIL

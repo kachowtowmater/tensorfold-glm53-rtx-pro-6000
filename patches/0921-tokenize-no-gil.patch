@@ -1,0 +1,98 @@
+# 0921 tokenize without holding the GIL (x14). Port of MiaAI-Lab patch 0099 (PR #108; merged in PR #131, 2026-10-10).
+# Source: github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold patches/0099.
+# Our server routes chat prompts through Aevonix 0079 IncrementalTokenizer, so incremental.py gets encode_batch_fast
+# (unsupported path) / encode_batch (tail, offsets still read); server.py gets App._encode_ids (Mia) at the prepare encode
+# closure, _encode fallback, think-close and tool-gate sites; vision/glm.py as Mia.
+# Same ids as encode (HF tokenizers batch calls run with the GIL released).
+
+diff --git tensorfold/cuda/incremental.py tensorfold/cuda/incremental.py
+index bef94f7..444a679 100644
+--- tensorfold/cuda/incremental.py
++++ tensorfold/cuda/incremental.py
+@@ -120,7 +120,8 @@ class IncrementalTokenizer:
+ 
+     def encode(self, text: str, *, add_special_tokens: bool = False):
+         if not self.supported:
+-            return self.tok.encode(text, add_special_tokens=add_special_tokens).ids
++            # patch 0921 (Mia 0099): the batch call tokenizes with the GIL released, the same ids as encode
++            return self.tok.encode_batch_fast([text], add_special_tokens=add_special_tokens)[0].ids
+         best = None
+         records = tuple(getattr(s, "w1_rendered", None) for s in tuple(self.kept()))
+         for item in records:
+@@ -152,7 +153,9 @@ class IncrementalTokenizer:
+             record, boundary, index = best
+             char, cut = boundary.char, boundary.token
+             old, boundaries, state = record.ids[:cut], list(record.boundaries[:index]), boundary.state
+-        tail = self.tok.encode(text[char:], add_special_tokens=add_special_tokens)
++        # patch 0921 (Mia 0099): encode_batch releases the GIL (encode holds it ~1.2 us a token, stalling every other
++        # stream at a long request's start); same ids and character offsets as encode (the offsets are read below)
++        tail = self.tok.encode_batch([text[char:]], add_special_tokens=add_special_tokens)[0]
+         ids = tail.ids
+         pos = 0
+         # Offsets are character indices, not UTF-8 bytes. No decoded token text is
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 9d12a34..29b75a0 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -199,7 +199,7 @@ class App:
+                 raise DecisionError(f"the chat template failed: {exc}") from exc
+ 
+         def encode(text: str) -> list[int]:
+-            return [int(token) for token in self.tok.encode(text, add_special_tokens=False).ids]
++            return [int(token) for token in self._encode_ids(text, False)]
+ 
+         try:
+             prepared = prompts_for(body, render, encode, context_len=self.effective_context_window)
+@@ -311,7 +311,15 @@ class App:
+         incremental = getattr(self, "incremental", None)
+         if incremental is not None:
+             return incremental.encode(text, add_special_tokens=add_special_tokens)
+-        return self.tok.encode(text, add_special_tokens=add_special_tokens).ids
++        return self._encode_ids(text, add_special_tokens)
++
++    def _encode_ids(self, text: str, special: bool) -> list[int]:
++        """``self.tok.encode(text, add_special_tokens=special).ids``, the same ids, through the batch call (patch 0921,
++        Mia 0099): it tokenizes with Python's GIL released (``encode`` holds it, ~1.2 us a token: a 600k-token prompt
++        stopped the engine loop, and every other stream, for ~0.8 s at each request's start) and skips the character
++        offsets nothing here reads."""
++
++        return self.tok.encode_batch_fast([text], add_special_tokens=special)[0].ids
+ 
+     def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
+         """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the
+@@ -666,9 +674,9 @@ class App:
+ 
+         if prepared.think_budget <= 0 or think_end is None:
+             return None
+-        close = [*self.tok.encode("\n", add_special_tokens=False).ids, think_end]
++        close = [*self._encode_ids("\n", False), think_end]
+         if prepared.grammar is None:
+-            close += self.tok.encode("\n\n", add_special_tokens=False).ids
++            close += self._encode_ids("\n\n", False)
+         return ThinkBudget(prepared.think_budget, close, think_end)
+ 
+     def _glm_calls(self) -> bool:
+@@ -707,7 +715,7 @@ class App:
+         names = [str((t.get("function") or t).get("name") or "") for t in tools] if lead is not None else []
+         return CallGate.after_prompt(prompt, self.tok.token_to_id(opener), blank, think_open=think[0],
+                                      think_end=think[1], text=text, lead=lead or "", names=names, tail=tail or "",
+-                                     encode=lambda t: list(self.tok.encode(t, add_special_tokens=False).ids))
++                                     encode=lambda t: list(self._encode_ids(t, False)))
+ 
+ 
+ def _concurrent_priority(engine) -> bool:
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+index 08b7bac..5e31394 100644
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -546,7 +546,9 @@ class GlmVision:
+                 pieces.append(rest[:v] + "<|begin_of_video|>" + frames + "<|end_of_video|>")
+                 items.append(("video", clip.frames))
+                 rest = rest[v + len(VIDEO_SPAN):]
+-        ids = self.tok.encode("".join(pieces), add_special_tokens=False).ids
++        # patch 0921 (Mia 0099): the batch call tokenizes with Python's GIL released (encode holds it, ~1.2 us a token: a
++        # long prompt with a picture stopped the engine loop and every other stream), the same ids (as App._encode_ids)
++        ids = self.tok.encode_batch_fast(["".join(pieces)], add_special_tokens=False)[0].ids
+         if max_prompt_tokens and len(ids) >= max_prompt_tokens:
+             # v0.6.0's context refusal wording (68c6e35, Apache-2.0): served as context_length_exceeded
+             raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the prompt with its images is {len(ids):,} "

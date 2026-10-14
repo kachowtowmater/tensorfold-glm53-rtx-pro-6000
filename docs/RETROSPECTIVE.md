@@ -1,10 +1,10 @@
 ---
-title: TensorFold × GLM-5.3-Flash on the GPU host — program retrospective (2026-10-05 → 10-07)
+title: TensorFold × GLM-5.3-Flash on our 4× RTX PRO 6000 box — program retrospective (2026-10-05 → 10-07)
 summary: Everything we tried to make GLM-5.3-Flash faster on 4× RTX PRO 6000 under TensorFold, with the measured result of each attempt (adopted, rejected, parked), the finding that closed the program (expert weight bytes are ~18% of a speculative decode step, so quant and top-k cannot move raw speed), the artifacts left on the shelf, and how to resume. Written at the operator's request so the negative results stay usable, like the InfLLM record.
 type: research
 status: closed (program stopped 2026-10-07 09:40 PT at the operator's call)
 updated: 2026-10-07
-cards: (internal card) (board `default`)
+cards: #1177–#1240 (our internal board)
 ---
 
 # 1. One-paragraph verdict
@@ -15,14 +15,14 @@ Raw single-stream decode of GLM-5.3-Flash on this box did **not** move: 223 tok/
 
 | item | value |
 |---|---|
-| box | the GPU host: 4× RTX PRO 6000 Blackwell Max-Q (96 GB each, PCIe, TP4), 250 W cap (settled), GPU 0 runs 88–92 °C under load (slot airflow, #1181) |
+| box | 4× RTX PRO 6000 Blackwell Max-Q (96 GB each, PCIe, TP4), 250 W cap (settled), GPU 0 runs 88–92 °C under load (slot airflow, #1181) |
 | engine | TensorFold v0.6.5 @609ca419 (ashhart; Python + torch-JIT CUDA kernels; **Python engine frozen upstream, dev moved to a Zig engine, issue #286**) |
 | recipe | Aevonix `GLM-5.3-Flash-EXL3-4x-RTX-PRO-6000-TensorFold` @a190785: 86 patches, base `nvcr.io/nvidia/pytorch` sha256:2140e69… |
 | weights | Mia-AiLab GLM-5.3-Flash-EXL3-4bpw-TensorFold (164 GB; EXL3 4-bit mcg routed experts, dense quantized at load, FP8 KV) |
 | drafter | incoai DFlash2 (block drafter, ~9 tokens verified/step), policy `fnc7:0.3` |
 | our image lineage | `tensorfold-glm53:1.1.0` → x1 (+commdata 0900) → x9 (+0910 vision-prefix) = **serving** · x10 (+0909 mixed-bit load, built, not serving) · x11 (profiling, in build) |
 | measurement | `/tmp/tfprobe2.py` 4 probes (prose greedy, code greedy, JSON greedy, prose t0.7/top_k20; server-side tok/s + accepted/drafted from rank0.log, ±1–2%) · `/tmp/agentsim.py 4 6 30000 40` (4 agents × 6 turns on 58k-token repos + 40-conversation churn, ±10–15% per cell) · `llm_decode_bench.py --test-profile gsm8k` · gate log (`docker logs model-gate`) for real traffic |
-| rules kept | a peer machine (a peer machine) firewalled during measured runs; the outside user's public endpoint smoke-tested after every serve change; liveness off while testing |
+| rules kept | other users' clients firewalled during measured runs; the public endpoint smoke-tested after every serve change; liveness off while testing |
 
 # 3. Baselines
 
@@ -74,7 +74,7 @@ Full baseline with every command: `baseline-x9-2026-10-07.json` (card #1223, ver
 - Layer checks H2/H3 and the L1 (memory) report via the `compare-semantic-path` tool (codemap paths + static counts + Jev score): `deliverables/1202-l1-report.md`, `1203-/1204-layer-check.md`, `../../tools/compare-semantic-path.md`.
 - Jev as a change-direction predictor: 10/15 direction accuracy vs 6/15 for always-"noise", Brier 0.097 vs 0.089 for always-"noise" → **WEAK**, not a gate (#1198).
 - `cache_reason` log analysis found the vision bypass (4,365 requests/day: vision 632 requests = 4,424 of ~5,550 prefill seconds) → 0910 and `models.yml` GLM entries text-only.
-- Drafter-data capture at model-gate (v5.17 → v5.18: tool_calls + reasoning captured, the outside user excluded by construction; ~10.5k records by 10-07 09:30, 74 unique tool-call records). Known gaps: lss-collector probe records (#1224, fixed by exclusion), 502-on-complete-streams (#1229), omp traffic bypasses the gate via llm-lb (#1233).
+- Drafter-data capture at model-gate (v5.17 → v5.18: tool_calls + reasoning captured, external users excluded by construction; ~10.5k records by 10-07 09:30, 74 unique tool-call records). Known gaps: lss-collector probe records (#1224, fixed by exclusion), 502-on-complete-streams (#1229), omp traffic bypasses the gate via llm-lb (#1233).
 
 ## 4.4 Window A dry run (10-07 00:00–01:50 PT, serve down 113 min) — `windowA-2026-10-07.md`
 | step | result |
@@ -98,13 +98,13 @@ Where the other ~16 ms per decode step go. Panel expectation (Dan, Zheng, He): T
 4. **The agent path pays; raw decode did not.** Cache misses (vision bypass, evictions), rank-split thresholds, sampler collapse, cold-prefix bursts: each was a real, reproducible 2×–20× on a real cell. Single-stream decode on a competent recipe is at its ceiling.
 5. **Dry-run windows catch the "whoopsie".** A missing `datasets` module and a 13-min-per-pass measurement would have surfaced at hour 10 of a long window; the 2 h dry run cost 113 min and also returned the top-k result and a 3× faster convert estimate.
 6. **Verifiers were worth every send-back.** Six send-backs on one baseline card caught a dropped 55% cache-miss class, a wrong p95, a missing third run, an unexecuted CJK canary and a scratch clone left behind. The mutation tests also caught a validator that accepted 16-bit experts and a window script whose hard clock never fired.
-7. **GLM workers + a hard host fence need a door.** Rule N (no worker ssh to the GPU host after the fork-loop incident) blocked 6 of 7 workers; `mcq-run`/`mcq-serve` (worker writes `mcq/run.sh`, lead runs it under a deny list, posts the log on the card) made them productive at ~1 round trip per scripting slip (shell function recursion, unexpanded `~`, relative paths after `cd`, loop variable `path` clobbering PATH in zsh).
+7. **GLM workers + a hard host fence need a door.** Rule N (no worker ssh to the GPU box after the fork-loop incident) blocked 6 of 7 workers; `mcq-run`/`mcq-serve` (worker writes `mcq/run.sh`, lead runs it under a deny list, posts the log on the card) made them productive at ~1 round trip per scripting slip (shell function recursion, unexpanded `~`, relative paths after `cd`, loop variable `path` clobbering PATH in zsh).
 8. **TensorFold's Python engine is frozen upstream.** Custom patches (0903–0910) are ours to maintain; the maintainer moved to Zig. Treat the recipe as a fork.
 
 # 6. On the shelf (how to resume)
 | artifact | where | state |
 |---|---|---|
-| serving recipe x9 | the GPU host `~/tf/recipe-x9` (d1ff3a9), image `tensorfold-glm53:1.1.0-x9`, `scripts/local.sh` = recipe v3 + `TF_GLM_VISION_PREFIX=1` | **live on :8090**; rollback `~/tf/recipe-x1` |
+| serving recipe x9 | `~/tf/recipe-x9` (d1ff3a9), image `tensorfold-glm53:1.1.0-x9`, `scripts/local.sh` = recipe v3 + `TF_GLM_VISION_PREFIX=1` | **live on :8090**; rollback `~/tf/recipe-x1` |
 | mixed-bit load build x10 | `~/tf/recipe-x10`, image `…-x10`, patch `patches/extra/0909-mixed-bits.patch` | built, probes identical to x9 |
 | profiling build x11 + `--no-drafts` passthrough | `~/tf/recipe-x11` (card #1238, in progress), patch 0911 | prep |
 | exllamav3 pipeline | `~/exl3/{venv,exllamav3@16a4979,tools/validate_recipe.py,tools/convert_monitor.py,cal/cal.safetensors}`; runbook `quant-runbook-2026-10-06.md` + Corrections | proven in Window A; convert ≈ 3–3.5 h |
@@ -113,7 +113,7 @@ Where the other ~16 ms per decode step go. Panel expectation (Dan, Zheng, He): T
 | window runbook | `~/tf/window/window.sh` (#1222; hard-clock fix in progress) | DRY-tested |
 | pre-flight gate | the seat `(internal task dir) 1225/preflight.sh` (13/14 PASS) | reusable |
 | baseline | `baseline-x9-2026-10-07.json` (this dir) | the BEFORE half of any future table |
-| measurement scripts | the GPU host `/tmp/{tfprobe2.py,quietprobe.sh,agentsim.py,burstprobe.py,visionprobe.py}` (copy into a repo before they vanish) | working |
+| measurement scripts | `/tmp/{tfprobe2.py,quietprobe.sh,agentsim.py,burstprobe.py,visionprobe.py}` (copy into a repo before they vanish) | working |
 
 Resume path if raw speed is wanted again: run Window P (2 h, #1240) with x11 + steptime.py → read the table → pick drafter retrain (flat step time), by-load draft depth (concurrency), kernel swap (named kernel), or collective fusion (PCIe floor). Resume path for the 170HX box: same recipe family; run the Morrowmake adaptive-depth fork natively there (#1234).
 

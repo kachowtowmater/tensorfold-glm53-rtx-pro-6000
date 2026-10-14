@@ -1,5 +1,5 @@
 # Window A — dry run, 2026-10-06 23:57 → 2026-10-07 01:50 PT (113 min, hard stop 150), run by orchestrator on the operator's go
-Blocked: all non-loopback clients on 8090/8096/8097 (+a peer machine) for the window; removed at the end. Serve restored on x9, probes identical, public smoke 200/chat/stream/tool_call PASS.
+Blocked: all non-loopback clients on 8090/8096/8097 (and one other user's host) for the window; removed at the end. Serve restored on x9, probes identical, public smoke 200/chat/stream/tool_call PASS.
 
 | step | verdict | evidence (windowA-logs/) |
 |---|---|---|

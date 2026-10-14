@@ -1,0 +1,54 @@
+{
+ "recipe": {
+  "name": "x14",
+  "image": "tensorfold-glm53:1.1.0-x14",
+  "change_vs_x9": "patches 0921 (tokenize without holding the GIL, port of MiaAI-Lab 0099) + 0923 (fastokens 0.3.2 prompt encoding, TF_W1_FASTOKENS=1); IMAGE_EXTRAS + fastokens==0.3.2; every other knob identical",
+  "model_id": "glm-5.3-flash-rtx"
+ },
+ "hardware": "4x NVIDIA RTX PRO 6000 Blackwell Max-Q (96 GB each, PCIe, TP4), 250 W cap",
+ "measured_at": "2026-10-13, x14 and x9 in the same window",
+ "method": "unique prompts per request (no prefix-cache hits), temperature 0",
+ "throughput_toks": {
+  "C1_code": {
+   "x9": 341.1,
+   "x14": 339.7
+  },
+  "C1_prose": {
+   "x9": 186.1,
+   "x14": 186.8
+  },
+  "C1_json": {
+   "x9": 419.2,
+   "x14": 416.8
+  },
+  "C8_aggregate": {
+   "x9": 695.6,
+   "x14": 705.7
+  },
+  "C32_aggregate": {
+   "x9": 1123.5,
+   "x14": 1132.6
+  },
+  "note": "C1 within +/-0.6% (noise); C8 +1.4%, C32 +0.8% (noise band)"
+ },
+ "long_session_corun": {
+  "setup": "a 400k-token cached session sends a request every 1 s (85 tokens out) while one short request decodes",
+  "short_request_decode_toks": {
+   "x9": 117.9,
+   "x14": 151.0
+  },
+  "change": "+28%",
+  "why": "in x9 each 400k-token request is tokenized by HF tokenizers (707-855 ms for 400k tokens) with the GIL held, which stalls the engine loop and the short stream once a second; x14 tokenizes it with fastokens in 41-44 ms with the GIL released"
+ },
+ "tokenize_400k_tokens_ms": {
+  "x9_hf_offsets_path": "707-855",
+  "x14_fastokens": "41-44"
+ },
+ "correctness_x14": {
+  "recall_326k": "8/8 (28,500-record ledger)",
+  "repetition": "none at 400k and 320k context",
+  "long_output": "8,192-token output clean",
+  "tool_call_plus_needle_300k": "pass",
+  "token_identity": "0 mismatches over 5,857,088 tokens (results/tok-check-x14-2026-10-13.log), mutation proof red on A and B"
+ }
+}

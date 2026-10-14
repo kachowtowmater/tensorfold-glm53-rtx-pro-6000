@@ -1,17 +1,23 @@
-3
+# Our production x14 recipe vs the Aevonix recipe it sits on (scripts only; patches/extra holds 0900 + 0910 x1 variant + 0921 + 0923).
 a19078566298f8c51d9dbb317f20efd51fe564df Sun Oct 4 16:34:45 2026 -0400
-35c35
+-- scripts/config.sh
+35,36c35,36
 < IMAGE="${IMAGE:-tensorfold-glm53:1.1.0}"
+< IMAGE_EXTRAS='av==18.1.0 xgrammar==0.2.8'
 ---
-> IMAGE="${IMAGE:-tensorfold-glm53:1.1.0-x9}"
----local.sh in aevonix?
-scripts/local.sh.example
+> IMAGE="${IMAGE:-tensorfold-glm53:1.1.0-x14}"
+> IMAGE_EXTRAS='av==18.1.0 xgrammar==0.2.8 fastokens==0.3.2'
+129a130,131
+> # x14 (patch 0923): fastokens prompt encoding; 0 = x9 + 0921 tokenization
+> export TF_W1_FASTOKENS="${TF_W1_FASTOKENS:-1}"
+-- scripts/local.sh: not in Aevonix (they ship scripts/local.sh.example); ours is scripts/local.sh in this repo
+-- scripts/apply-patches.sh
 27,28c27,28
 < mapfile -t patches < <(cd "$repo_dir" && printf '%s\n' patches/{miaai-lab,aevonix}/*.patch | sort -t / -k3,3)
 < [[ ${#patches[@]} == 86 ]] || fail 'expected exactly 86 release patches'
 ---
 > mapfile -t patches < <(cd "$repo_dir" && printf '%s\n' patches/{miaai-lab,aevonix,extra}/*.patch | sort -t / -k3,3)
-> [[ ${#patches[@]} == 88 ]] || fail 'expected exactly 88 patches (86 release + 2 extra)'
+> [[ ${#patches[@]} == 90 ]] || fail 'expected exactly 90 patches (86 release + 4 extra: x9 0900 0910, x14 0921 0923)'
 67a68,74
 >   # A patch may carry a "# root-relative" marker: it is applied from the target root instead of
 >   # patch_dir (used for series additions that also touch tests/, which live beside src/).
@@ -34,11 +40,12 @@ scripts/local.sh.example
 < printf 'Applied %s patches to TensorFold v0.6.5 successfully (no fuzz, offsets, .rej or .orig).\n' "${#patches[@]}"
 ---
 > printf 'Applied %s patches (86 release + extra) to TensorFold v0.6.5 successfully (no fuzz, offsets, .rej or .orig).\n' "${#patches[@]}"
+-- scripts/prepare.sh
 40c40
 <   (( ${#PATCHES[@]} == 86 )) || fail E_PATCHES 'The release requires exactly 86 patches.'
 ---
->   (( ${#PATCHES[@]} == 88 )) || fail E_PATCHES 'The x1 build requires exactly 88 patches (86 release + 1 extra).'
+>   (( ${#PATCHES[@]} == 90 )) || fail E_PATCHES 'The x14 build requires exactly 90 patches (86 release + 4 extra).'
 116c116
 <   log "Build $IMAGE: clone TensorFold $TF_VERSION at $TF_COMMIT, apply 86 patches, install runtime."
 ---
->   log "Build $IMAGE: clone TensorFold $TF_VERSION at $TF_COMMIT, apply 88 patches (86 release + 2 extra), install runtime."
+>   log "Build $IMAGE: clone TensorFold $TF_VERSION at $TF_COMMIT, apply 90 patches (86 release + 4 extra), install runtime."

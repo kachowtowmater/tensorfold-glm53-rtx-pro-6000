@@ -1,0 +1,197 @@
+# 0923 fastokens prompt encoding behind TF_W1_FASTOKENS=1 (x14). Applies after 0921 (uses App._encode_ids).
+# fastokens 0.3.2 (github.com/crusoecloud/fastokens c1e193ea, Apache-2.0, PyPI wheel in IMAGE_EXTRAS); idea from
+# local-inference-lab vllm #934 / blackwell-llm-docker #112 (VLLM_USE_FASTOKENS). New tensorfold/cuda/fasttok.py; server.py
+# App._encode_ids, the IncrementalTokenizer tail (literal barriers from the text, HF-offsets fallback on any disagreement)
+# and vision/glm.py use it. Off (TF_W1_FASTOKENS=0) = x9 + 0921 exactly.
+
+diff --git tensorfold/cuda/fasttok.py tensorfold/cuda/fasttok.py
+new file mode 100644
+index 0000000..73bc8ee
+--- /dev/null
++++ tensorfold/cuda/fasttok.py
+@@ -0,0 +1,46 @@
++"""patch 0923 (x14): fastokens-backed prompt encoding, enabled only by TF_W1_FASTOKENS=1.
++
++fastokens (github.com/crusoecloud/fastokens, pinned 0.3.2 in the image) re-implements the tokenizer.json BPE
++pipeline in Rust. Its ``encode_batch_flat`` tokenizes with Python's GIL released and splits one long input across
++worker threads (FASTOKENS_BPE_THREADS, default min(cores, 32)); a 300k-token prompt is ~27 ms vs ~450 ms in HF
++tokenizers (rtx6kpro daily 2026-09-30, LIL vllm #934). It returns ids only (no character offsets), so it serves the
++id-only call sites; the incremental tokenizer derives its literal barriers from the text itself and falls back to HF
++tokenizers whenever the two disagree. Decoding, chat templates and every other tokenizer use stay on HF tokenizers.
++Off (TF_W1_FASTOKENS=0, the default) the server is byte-for-byte the x9 + 0921 behaviour.
++"""
++from __future__ import annotations
++
++import os
++import sys
++from array import array
++
++
++def enabled() -> bool:
++    value = os.environ.get("TF_W1_FASTOKENS", "0")
++    if value not in ("0", "1"):
++        raise ValueError("TF_W1_FASTOKENS must be 0 or 1")
++    return value == "1"
++
++
++class FastEncoder:
++    """``ids(text, special)`` == ``tokenizers.Tokenizer.encode(text, add_special_tokens=special).ids`` (checked by the
++    x14 identity gate over the 400k corpus, the needle corpus and varied texts), computed without holding the GIL."""
++
++    def __init__(self, path) -> None:
++        from fastokens._native import Tokenizer
++
++        if sys.byteorder != "little" or array("I").itemsize != 4:
++            raise RuntimeError("fastokens flat ids are little-endian uint32")
++        self.tok = Tokenizer.from_file(str(path))
++
++    def ids(self, text: str, special: bool = False) -> list[int]:
++        buf, _ = self.tok.encode_batch_flat([text], add_special_tokens=special)
++        out = array("I")
++        out.frombytes(buf)
++        return out.tolist()
++
++
++def load(path):
++    """A FastEncoder for ``path`` when TF_W1_FASTOKENS=1, else None (the HF tokenizers path)."""
++
++    return FastEncoder(path) if enabled() else None
+diff --git tensorfold/cuda/incremental.py tensorfold/cuda/incremental.py
+index 444a679..9a0786b 100644
+--- tensorfold/cuda/incremental.py
++++ tensorfold/cuda/incremental.py
+@@ -84,8 +84,8 @@ class IncrementalTokenizer:
+     The server owns its tokenizer and does not mutate it after construction.
+     """
+ 
+-    def __init__(self, tokenizer, kept=lambda: ()):
+-        self.tok, self.kept = tokenizer, kept
++    def __init__(self, tokenizer, kept=lambda: (), fast=None):
++        self.tok, self.kept, self.fast = tokenizer, kept, fast   # fast: patch 0923 FastEncoder or None
+         cfg = json.loads(tokenizer.to_str())
+         added = cfg.get("added_tokens", [])
+         self.literals = {t["id"]: t["content"] for t in added}
+@@ -118,8 +118,31 @@ class IncrementalTokenizer:
+                 return False
+         return True
+ 
++    def _fast_tail(self, tail: str, add_special_tokens: bool):
++        """Patch 0923: (ids, [(char, token index) of each literal]) from fastokens, or None to use the HF path.
++
++        The accepted profile extracts added tokens leftmost-longest before BPE, so the k-th literal id in ``ids`` is
++        the k-th non-overlapping match of ``self.pattern`` (longest alternative first) in ``tail``. Any disagreement
++        (count, id or content) returns None, and the caller re-encodes with HF tokenizers' offsets."""
++
++        if add_special_tokens:
++            return None
++        ids = self.fast.ids(tail, False)
++        found = [(i, self.literals[t]) for i, t in enumerate(ids) if t in self.literals]
++        matches = list(self.pattern.finditer(tail)) if self.literals else []
++        if len(found) != len(matches):
++            return None
++        marks = []
++        for (i, literal), m in zip(found, matches):
++            if m.group(0) != literal:
++                return None
++            marks.append((m.start(), i))
++        return ids, marks
++
+     def encode(self, text: str, *, add_special_tokens: bool = False):
+         if not self.supported:
++            if self.fast is not None:   # patch 0923
++                return self.fast.ids(text, add_special_tokens)
+             # patch 0921 (Mia 0099): the batch call tokenizes with the GIL released, the same ids as encode
+             return self.tok.encode_batch_fast([text], add_special_tokens=add_special_tokens)[0].ids
+         best = None
+@@ -153,18 +176,22 @@ class IncrementalTokenizer:
+             record, boundary, index = best
+             char, cut = boundary.char, boundary.token
+             old, boundaries, state = record.ids[:cut], list(record.boundaries[:index]), boundary.state
+-        # patch 0921 (Mia 0099): encode_batch releases the GIL (encode holds it ~1.2 us a token, stalling every other
+-        # stream at a long request's start); same ids and character offsets as encode (the offsets are read below)
+-        tail = self.tok.encode_batch([text[char:]], add_special_tokens=add_special_tokens)[0]
+-        ids = tail.ids
++        marks = self._fast_tail(text[char:], add_special_tokens) if self.fast is not None else None
++        if marks is not None:   # patch 0923: fastokens ids, literal barriers from the text (no offsets needed)
++            ids, marks = marks
++        else:
++            # patch 0921 (Mia 0099): encode_batch releases the GIL (encode holds it ~1.2 us a token, stalling every other
++            # stream at a long request's start); same ids and character offsets as encode (the offsets are read below)
++            tail = self.tok.encode_batch([text[char:]], add_special_tokens=add_special_tokens)[0]
++            ids = tail.ids
++            # Offsets are character indices, not UTF-8 bytes. No decoded token text is
++            # used for byte fallback, emoji, CRLF or combining characters.
++            marks = [(start, i) for i, (token, (start, end)) in enumerate(zip(ids, tail.offsets))
++                     if (literal := self.literals.get(token)) is not None and text[char + start:char + end] == literal]
+         pos = 0
+-        # Offsets are character indices, not UTF-8 bytes. No decoded token text is
+-        # used for byte fallback, emoji, CRLF or combining characters.
+-        for i, (token, (start, end)) in enumerate(zip(ids, tail.offsets)):
+-            literal = self.literals.get(token)
+-            if literal is not None and text[char + start:char + end] == literal:
+-                state = _extend(state, ids[pos:i], cut + pos)
+-                pos = i
+-                boundaries.append(Boundary(char + start, cut + i, state))
++        for start, i in marks:
++            state = _extend(state, ids[pos:i], cut + pos)
++            pos = i
++            boundaries.append(Boundary(char + start, cut + i, state))
+         state = _extend(state, ids[pos:], cut + pos)
+         return PromptIds(Rendered(text, (*old, *ids), tuple(boundaries), state, cut))
+diff --git tensorfold/cuda/server.py tensorfold/cuda/server.py
+index 29b75a0..f00da70 100644
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -90,11 +90,13 @@ class App:
+         self.aliases = tuple(str(alias).strip() for alias in aliases if str(alias).strip())
+         self.model_dir = Path(model_dir)
+         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
++        from tensorfold.cuda.fasttok import load as fast_load
+         from tensorfold.cuda.incremental import IncrementalTokenizer, enabled
+ 
++        self.fast = fast_load(model_dir / "tokenizer.json")   # patch 0923: None unless TF_W1_FASTOKENS=1
+         self.incremental = IncrementalTokenizer(self.tok, lambda: tuple(
+             engine.multi.kept if getattr(engine, "multi", None) is not None else getattr(engine, "cache", ())
+-        )) if enabled() else None
++        ), fast=self.fast) if enabled() else None
+         self.template = ChatTemplate(model_dir)
+         self.default_thinking = default_thinking
+         self.reasoning_effort, self.thinking_budget = reasoning_effort, int(thinking_budget)   # the Mac's defaults
+@@ -317,8 +319,11 @@ class App:
+         """``self.tok.encode(text, add_special_tokens=special).ids``, the same ids, through the batch call (patch 0921,
+         Mia 0099): it tokenizes with Python's GIL released (``encode`` holds it, ~1.2 us a token: a 600k-token prompt
+         stopped the engine loop, and every other stream, for ~0.8 s at each request's start) and skips the character
+-        offsets nothing here reads."""
++        offsets nothing here reads. Patch 0923: with TF_W1_FASTOKENS=1 the same ids come from fastokens."""
+ 
++        fast = getattr(self, "fast", None)
++        if fast is not None:
++            return fast.ids(text, special)
+         return self.tok.encode_batch_fast([text], add_special_tokens=special)[0].ids
+ 
+     def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
+diff --git tensorfold/vision/glm.py tensorfold/vision/glm.py
+index 5e31394..059a5e3 100644
+--- tensorfold/vision/glm.py
++++ tensorfold/vision/glm.py
+@@ -422,6 +422,9 @@ class GlmVision:
+         self.allow_urls = allow_urls
+         self.limits = limits or GlmVisionLimits.from_env()
+         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
++        from tensorfold.cuda.fasttok import load as fast_load
++
++        self.fast = fast_load(model_dir / "tokenizer.json")   # patch 0923: None unless TF_W1_FASTOKENS=1
+         if self.tok.token_to_id(IMAGE) != self.image_token:
+             raise ValueError("the tokenizer's <|image|> id does not match config.json's image_token_id")
+         self.tower = GlmVisionTower(model_dir, device)
+@@ -548,7 +551,9 @@ class GlmVision:
+                 rest = rest[v + len(VIDEO_SPAN):]
+         # patch 0921 (Mia 0099): the batch call tokenizes with Python's GIL released (encode holds it, ~1.2 us a token: a
+         # long prompt with a picture stopped the engine loop and every other stream), the same ids (as App._encode_ids)
+-        ids = self.tok.encode_batch_fast(["".join(pieces)], add_special_tokens=False)[0].ids
++        fast = getattr(self, "fast", None)   # patch 0923: fastokens ids when TF_W1_FASTOKENS=1
++        ids = fast.ids("".join(pieces), False) if fast is not None else \
++            self.tok.encode_batch_fast(["".join(pieces)], add_special_tokens=False)[0].ids
+         if max_prompt_tokens and len(ids) >= max_prompt_tokens:
+             # v0.6.0's context refusal wording (68c6e35, Apache-2.0): served as context_length_exceeded
+             raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the prompt with its images is {len(ids):,} "
