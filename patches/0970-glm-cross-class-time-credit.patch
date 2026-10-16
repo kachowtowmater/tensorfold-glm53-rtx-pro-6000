@@ -1,0 +1,59 @@
+# root-relative: applied from the repository root (src/ paths).
+# 0970: cross-class time credit -- with TF_GLM_FILL_CREDIT=time, the chunk-vs-round choice between
+# DIFFERENT priority classes also uses elapsed service time. 0900's TimeCredit only contends when the filling
+# stream's class equals the soonest decoding stream's (Arbiter.choose passed a None key otherwise), so a
+# background 400K prompt against normal decoders fell back to the iteration-credit path and took most of the
+# wall time. The credit is now keyed by (fill_class, round_class) every iteration, and the share rides the key:
+# the engine's share when the classes are equal, TENSORFOLD_PRIORITY_DOWN_SHARE when the fill is a later class
+# (the decoders keep 1 - down_share of the wall time, ~0.75), TENSORFOLD_PRIORITY_UP_SHARE when the fill is a
+# sooner class (up_share 1.0 sends the chunk every time choose() is asked). TimeCredit carried one fixed share,
+# so contend() takes the iteration's share next to the key and applies it before the key switch is recorded; a
+# one-arg contend (idle, no-arbiter, the 0900 tests) keeps the share it had. The priority/deadline overrides
+# above the credit (round gap, starvation, short rows, realtime head) still win, unchanged. TF_GLM_FILL_CREDIT
+# unset (steps) never constructs the TimeCredit, so steps-mode behaviour is byte-identical.
+# x21-id: 0970
+# x21-flag: TF_GLM_FILL_CREDIT=time (existing flag; no new one)
+# x21-source: the C2/C3 decode-share gate (>= 0.70; red 0.351/0.282 on the pre-patch tree)
+# x21-guard: Arbiter.choose TimeCredit.contend key/share pairing in cuda/priority.py
+
+--- src/tensorfold/cuda/priority.py
++++ src/tensorfold/cuda/priority.py
+@@ -265,19 +265,22 @@
+ 
+ 
+ class TimeCredit:
+-    """Serial completed-service credit, in seconds. Only contention earns credit; idle/class changes reset it.
+-
+-    Decode earns share*t; prefill spends (1-share)*t. A nonpositive balance chooses decode first, then repays with
+-    whole chunks. Thus overshoot is bounded by a service quantum unless a priority/deadline rule forces service.
++    """Serial completed-service credit, in seconds. Only contention earns credit; idle/key changes reset it.
++
++    Decode earns share*t; prefill spends (1-share)*t, so share is the filling side's wall share and rides the
++    (fill_class, round_class) key. A nonpositive balance chooses decode first, then repays with whole chunks. Thus
++    overshoot is bounded by a service quantum unless a priority/deadline rule forces service.
+     """
+ 
+     def __init__(self, share: float) -> None:
+         self.share, self.balance, self.key = float(share), 0.0, None
+         self.seconds = {"prefill": 0.0, "decode": 0.0}
+ 
+-    def contend(self, key) -> None:
++    def contend(self, key, share: float | None = None) -> None:
+         if key != self.key or key is None:
+             self.balance = 0.0
++        if share is not None:
++            self.share = float(share)
+         self.key = key
+ 
+     def choose(self) -> bool:
+@@ -308,7 +311,9 @@
+         s = self.s
+         now = self.clock()
+         if self.time_credit is not None:
+-            self.time_credit.contend(fill_class if fill_class == round_class else None)
++            self.time_credit.contend((fill_class, round_class),
++                                     self.share if fill_class == round_class
++                                     else s.up_share if fill_class < round_class else s.down_share)
+         if self.last_round is not None and now - self.last_round >= s.round_gap_s:
+             self.counts["overdue"] += 1
+             return self._round()

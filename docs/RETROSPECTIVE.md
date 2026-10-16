@@ -125,4 +125,3 @@ Resume path if raw speed is wanted again: run Window P (2 h, #1240) with x11 + s
 - Runbooks: `quant-runbook-2026-10-06.md`, `drafter-runbook-2026-10-06.md`.
 - Worker research: `deliverables/` (knob matrix, forks and knobs, TF gaps, port candidates, mixed-chunk and mixed-expert designs, L1 report, layer checks, drafter plan, training README).
 - Ledger rows: `../../infrastructure/loadout-ledger.md` 2026-10-05/06 (APPLIED ×4, TRIED ×1).
-- Cards: `tb default show <id>` for #1177–#1240; raw worker outputs under the seat `(internal task dir) <id>/`.

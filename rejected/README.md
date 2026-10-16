@@ -29,4 +29,20 @@ Same box and scripts, paired against x9 in the same window. The co-run is a 400k
 
 **Methodology lesson.** Measuring with other users' traffic on the box produced fake 1.2–1.9× "wins" this week. Block outside traffic for the whole A/B window and run both arms inside it.
 
+## Week of 2026-10-14/16 (x15 → x25), what lost while shipping the gains
+
+Same box and scripts, paired against the control of the day. These are the candidates that did not make the release; the shipped ones are in the main README.
+
+| change | idea | measured | why rejected |
+|---|---|---|---|
+| x16 A1a select one-pass (`0930`, `TF_GLM_SEL_ONEPASS=1`) | read a prompt chunk's top-512 pools in one pass over the scores instead of two | no gain on the measured paths | the two-pass path was already fast enough; patch ships flag-off |
+| x16 B verbatim conversation history | keep every past turn's tokens verbatim instead of the trimmed kept state | no gain on TensorFold's kept-state cache | memory for nothing |
+| x16 C stream rejection on 429 | reject overflow requests at the stream level | converts queueing delay into client errors | worse failure mode for the same load |
+| x16 cache-share count (`0932`, `TF_GLM_CACHE_SHARE_PCT`) | size the kept-state count from a share of the pool's free memory | no measurable latency change at the tested shares | ships flag-off as a safety valve, not an adopt |
+| `FILL_ROWS` 2048 / 1024 (after x15) | smaller fill chunks for smoother interleaving | long-prompt TTFT **+15% / +85%** | chunks are already the right size under time-credit fairness |
+| GVR top-k port | GPU radix top-k from another stack | C1 **−9%**, 400k decode **−11%** | slower than the recipe's selection; superseded by the x24 fused kernel |
+| IndexShare on Flash | share indexer state across ranks | lossy on GLM-5.3-Flash (output differs) | exactness is a hard requirement here |
+| ForceP2P (`NCCL_P2P_LEVEL` overrides) | force peer-to-peer for every NCCL collective | no gain — the cards already do 54 GB/s P2P where it matters; the recipe disables P2P only where shared memory wins twice | nothing to adopt |
+| Mixed decode+prefill forward pass | one forward for both classes | NO-GO: exactness forces dual kernel routes | see `0905`/`0908` above; the scheduler-side fixes (x21/x23) got the win without it |
+
 Numbers and context: `docs/RETROSPECTIVE.md`.

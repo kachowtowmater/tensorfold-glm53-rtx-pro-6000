@@ -1,0 +1,215 @@
+# 0930 (x16 A1a): a prompt chunk's top-512 pools from one pass over the scores,
+# behind TF_GLM_SEL_ONEPASS=1 (default off). New tensorfold/families/glm5_next/cuda/sel_onepass.py
+# (_sample_floor, _select_floor: a sampled floor, one pass compacts the pools at or above it, then
+# _select_rows' radix select over the candidates in registers; a row that misses [512, CAP]
+# candidates takes _select_rows itself). sparse.py's _top_prompt runs it ahead of patch 0199's
+# topk_fast (a1a-on must win; with the flag off _top_prompt is the x15 path exactly) and
+# PromptSelect passes its candidate scratch from the chunk's allocation.
+# Source: MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold 229846fb553cf623c88286d8731367a599e27951
+# (patches/0101-glm-prompt-select-floor.patch; 07f3777a's path-resolve fix is E's, not this port).
+# x16-id: A1a
+# x16-flag: TF_GLM_SEL_ONEPASS
+# x16-source: miaai-lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold 229846fb553cf623c88286d8731367a599e27951 patches/0101-glm-prompt-select-floor.patch
+# x16-entry: tensorfold.families.glm5_next.cuda.sel_onepass:prompt_pools
+# x16-guard: TF_GLM_SEL_ONEPASS sel_onepass
+
+--- tensorfold/families/glm5_next/cuda/sel_onepass.py
++++ tensorfold/families/glm5_next/cuda/sel_onepass.py
+@@ -0,0 +1,150 @@
++"""patch 0930 (x16) A1a: a prompt chunk's top-512 pools from one pass over the scores
++(``sparse._top_prompt`` on ``TF_GLM_SEL_ONEPASS=1``) instead of ``_select_rows``' five passes, taking precedence over
++``topk_fast`` (patch 0199). A strided sample of the row sets a floor, one pass compacts the pools at or above it in
++pool order into a scratch (2 * CAP int32 a row), and ``_select_rows``' radix select and write run over those
++candidates in registers. The candidates are an upper set of the row's order: with between K and CAP of them, the K
++best of the row and every tie at the K-th best are among them, so the pools and ties are ``_select_rows``'. A row
++whose candidate count misses [K, CAP] takes ``_select_rows`` itself. The floor only picks the path; CAP, TARGET, the
++sample, BLOCK and warps are speed only.
++
++Off (TF_GLM_SEL_ONEPASS unset or 0) ``sparse._top_prompt`` runs the x15 path exactly (topk_fast, else _select_rows
++per row). Port of MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold patch 0101 (229846f,
++patches/0101-glm-prompt-select-floor.patch, Apache-2.0; tools/select_floor_check.py proves the pools on the GPU),
++moved to its own module: our series' ``sparse`` carries the PromptSelect split (patch 0120) and 0199, which Mia's
++tree does not."""
++
++from __future__ import annotations
++
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++from .sparse import TOPK_POOLS, _order_key, _select_rows
++
++
++def on() -> bool:
++    """TF_GLM_SEL_ONEPASS: 1 runs the one-pass selection (checked against _select_rows on the first call of the
++    process), 0 or unset (default) the x15 path."""
++
++    value = (os.environ.get("TF_GLM_SEL_ONEPASS", "") or "0").strip()
++    if value not in ("0", "1"):
++        raise ValueError(f"TF_GLM_SEL_ONEPASS: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++# (most scores a row, CAP, TARGET) for ``prompt_tile``: speed only
++PROMPT_TILES = ((12288, 1024, 724), (32768, 2048, 1024), (1 << 62, 4096, 2048))
++PROMPT_SECTORS = 512       # the sample: 512 runs of 8 scores (32 bytes) spread over the row
++
++
++def prompt_tile(np_: int) -> tuple[int, int]:
++    """_select_floor's CAP and TARGET for rows of np_ scores (speed only)."""
++
++    return next((cap, target) for most, cap, target in PROMPT_TILES if np_ <= most)
++
++
++@triton.jit
++def _radix_step(hist, need, prefix, fixed, p: tl.constexpr):
++    """_select_rows' pass p (8 bits from the top) from its histogram: the K-th best's digit into the prefix, the
++    count still needed among the pools equal to the prefix so far, the prefix's fixed bits."""
++
++    bins = tl.arange(0, 256)
++    at_or_above = tl.sum(hist, 0) - tl.cumsum(hist, 0) + hist           # pools with this digit or a higher one
++    digit = tl.max(tl.where(at_or_above >= need, bins, 0), 0)
++    need -= tl.sum(tl.where(bins > digit, hist, 0), 0)
++    prefix = prefix | (digit.to(tl.uint32) << (24 - 8 * p))
++    fixed = fixed | (tl.full((), 0xFF, tl.uint32) << (24 - 8 * p))
++    return need, prefix, fixed
++
++
++@triton.jit
++def _tile_select(u, idx, ok, OUT, r, K: tl.constexpr):
++    """_select_rows on a tile: keys u of pools idx (ascending) where ok, the K best's pools ascending into OUT[r]."""
++
++    prefix = tl.zeros((), dtype=tl.uint32)
++    fixed = tl.zeros((), dtype=tl.uint32)
++    need = K
++    for p in tl.static_range(4):
++        hist = tl.histogram(((u >> (24 - 8 * p)) & 0xFF).to(tl.int32), 256, mask=ok & ((u & fixed) == prefix))
++        need, prefix, fixed = _radix_step(hist, need, prefix, fixed, p)
++    eq = (ok & (u == prefix)).to(tl.int32)
++    take = (ok & (u > prefix)) | ((eq == 1) & (tl.cumsum(eq, 0) - eq < need))
++    t = take.to(tl.int32)
++    tl.store(OUT + r * K + tl.cumsum(t, 0) - t, idx.to(tl.int64), mask=take)
++
++
++@triton.jit
++def _sample_floor(row, NP, NS: tl.constexpr, TARGET: tl.constexpr):
++    """A floor key for a row of NP scores: the 16-bit prefix of the sample's rank that scales to TARGET pools (NS
++    runs of 8 scores at even spacing, 32-byte aligned; on rows under NS * 8 scores runs repeat). Speed only."""
++
++    s = tl.arange(0, NS * 8)
++    j = ((s // 8).to(tl.int64) * NP // NS) // 8 * 8 + s % 8
++    su = _order_key(tl.load(row + j, mask=j < NP, other=0.0))
++    prefix = tl.zeros((), dtype=tl.uint32)
++    fixed = tl.zeros((), dtype=tl.uint32)
++    need = tl.maximum(TARGET * (NS * 8) // NP, 1)
++    for p in tl.static_range(2):
++        hist = tl.histogram(((su >> (24 - 8 * p)) & 0xFF).to(tl.int32), 256, mask=(su & fixed) == prefix)
++        need, prefix, fixed = _radix_step(hist, need, prefix, fixed, p)
++    return prefix
++
++
++@triton.jit
++def _select_floor(S, OUT, CAND, NP, K: tl.constexpr, CAP: tl.constexpr, NS: tl.constexpr, TARGET: tl.constexpr,
++                  BLOCK: tl.constexpr):
++    """Program r: row r's (NP scores) K best pools ascending into OUT[r], as _select_rows (this module's head
++    comment). A row of at most CAP scores is one tile; else one pass compacts the pools at or above the floor
++    (keys, then pools) into CAND[r] (2 * CAP int32), and the tile is those, or the row takes _select_rows."""
++
++    r = tl.program_id(0).to(tl.int64)
++    row = S + r * NP
++    c = tl.arange(0, CAP)
++    if NP <= CAP:
++        ok = c < NP
++        _tile_select(_order_key(tl.load(row + c, mask=ok, other=0.0)), c, ok, OUT, r, K)
++    else:
++        lo = _sample_floor(row, NP, NS, TARGET)
++        ck = CAND + r * (2 * CAP)
++        n = 0
++        for b in range(0, NP, BLOCK):
++            i = b + tl.arange(0, BLOCK)
++            ok = i < NP
++            u = _order_key(tl.load(row + i, mask=ok, other=0.0))
++            sel = ok & (u >= lo)
++            t = sel.to(tl.int32)
++            m = tl.sum(t, 0)
++            if m > 0:
++                at = n + tl.cumsum(t, 0) - t
++                put = sel & (at < CAP)
++                tl.store(ck + at, u.to(tl.int32, bitcast=True), mask=put)
++                tl.store(ck + CAP + at, i, mask=put)
++            n += m
++        if (n >= K) & (n <= CAP):
++            tl.debug_barrier()                           # the candidates other threads stored, before reading them
++            ok = c < n
++            u = tl.load(ck + c, mask=ok, other=0).to(tl.uint32, bitcast=True)
++            _tile_select(u, tl.load(ck + CAP + c, mask=ok, other=0), ok, OUT, r, K)
++        else:
++            _select_rows(S, OUT, NP, S, K, 1024, False)
++
++
++def prompt_pools(scores: torch.Tensor, k: int, scratch: torch.Tensor | None = None) -> torch.Tensor:
++    """top_pools' pools for prompt rows (no visible bounds), by _select_floor: one program a row, 4,096 scores a
++    step for blocks of up to 32 rows (fewer programs than the RTX PRO 6000's 188 SMs), else 1,024; ``scratch``:
++    int32, at least R * 2 * prompt_tile(NP)[0]."""
++
++    R, NP = scores.shape
++    if NP < k or not scores.is_contiguous():
++        raise ValueError("prompt_pools: contiguous rows of at least k scores")
++    cap, target = prompt_tile(NP)
++    if scratch is None:
++        scratch = torch.empty((R * 2 * cap,), dtype=torch.int32, device=scores.device)
++    elif scratch.dtype != torch.int32 or scratch.numel() < R * 2 * cap:
++        raise ValueError(f"prompt_pools: the scratch needs {R * 2 * cap} int32")
++    out = torch.empty((R, k), dtype=torch.int64, device=scores.device)
++    _select_floor[(R,)](scores, out, scratch, NP, K=k, CAP=cap, NS=PROMPT_SECTORS, TARGET=target,
++                        BLOCK=4096 if R <= 32 else 1024, num_warps=8)
++    return out
+
+--- tensorfold/families/glm5_next/cuda/sparse.py
++++ tensorfold/families/glm5_next/cuda/sparse.py
+@@ -402,8 +402,14 @@
+ 
+ 
+ def _top_prompt(scores: torch.Tensor) -> torch.Tensor:
+-    """A prompt block's top-512 pools (``top_pools``); TF_GLM_TOPK_FAST=1 (patch 0199, ``topk_fast``): the same pools
+-    by a kernel that reads the scores twice, once checked on this GPU."""
++    """A prompt block's top-512 pools (``top_pools``); TF_GLM_SEL_ONEPASS=1 (patch 0930, ``sel_onepass``): the same
++    pools from one pass over the scores, checked once on this GPU and ahead of patch 0199's ``topk_fast``; else
++    TF_GLM_TOPK_FAST=1 (patch 0199, ``topk_fast``): the same pools by a kernel that reads the scores twice, once
++    checked on this GPU."""
++    from . import sel_onepass
++
++    if sel_onepass.on():                                             # TF_GLM_SEL_ONEPASS wins over topk_fast
++        return sel_onepass.prompt_pools(scores, TOPK_POOLS)
+     from . import topk_fast
+ 
+     if topk_fast.ENABLED and topk_fast.on(scores):
+@@ -435,7 +441,13 @@
+         self.rb = score_rows()
+         self.width = TOPK_POOLS * POOL + POOL - 1
+         self.pkv, self.pks, self.rs, self.fp8 = kv8.parts(pk)
++        # patch 0930 (TF_GLM_SEL_ONEPASS): _select_floor's candidate scratch for one block (2 * CAP int32 a row),
++        # allocated once with the chunk; unused unless the flag is on
++        from . import sel_onepass
+ 
++        self.cand = torch.empty((self.B * 2 * sel_onepass.prompt_tile(self.NP)[0],), dtype=torch.int32,
++                                device=self.dev)
++
+     def outputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+         return (torch.empty((self.R, self.width), dtype=torch.int32, device=self.dev),
+                 torch.empty((self.R,), dtype=torch.int32, device=self.dev))
+@@ -465,6 +477,12 @@
+             self.qi[a:a + n], self.wts[a:a + n], self.wts.stride(0), self.pkv, self.pks, scores, at, n, NP,
+             self.D ** -0.5, self.wscale, H=self.H, HP=max(16, triton.next_power_of_2(self.H)), D=self.D, BP=64,
+             RB=self.rb, RS=self.rs, FP8=self.fp8, num_warps=4)
++        # TF_GLM_SEL_ONEPASS=1 (patch 0930): _select_floor's pools from the block's scores already in the buffer;
++        # cand: this block's candidate scratch (2 * CAP int32 a row), allocated with the chunk's
++        from . import sel_onepass
++
++        if sel_onepass.on():
++            return sel_onepass.prompt_pools(scores, TOPK_POOLS, self.cand[:self.rows(a) * 2 * sel_onepass.prompt_tile(NP)[0]])
+         return _top_prompt(scores)                                                     # ascending pool index
+ 
+     def write_tokens(self, a: int, pools: torch.Tensor, at: torch.Tensor, tokens: torch.Tensor,

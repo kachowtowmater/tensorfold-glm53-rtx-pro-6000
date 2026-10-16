@@ -1,0 +1,28 @@
+# root-relative: applied from the repository root (src/ paths).
+# 0972: a multi-prefill chunk led by a normal (or sooner) lane no longer packs rows from lanes of a
+# LATER priority class. _group admitted any plain lane when the lead was not realtime/interactive
+# ('top > prio.INTERACTIVE or l.s.priority <= top'), so with 0970's cross-class time credit a short normal
+# prompt's chunk also carried background rows: a ~300-row short-prompt chunk became a full 4,096-row
+# deep-context chunk (~476-488 ms), and the admission stall the prober saw (12 decode gaps of 1.0-1.24 s in
+# 60 s, each right after a chat admission) is those chunks repaid whole by the credit. The lead now shares
+# its chunk only with its class or sooner unless the lead itself is background: 'top > prio.NORMAL'. A
+# realtime/interactive lead keeps the old, stricter rule unchanged (a realtime or interactive prompt already
+# only shared with its class or sooner), and background-led chunks keep taking later rows. S1b's normal-only
+# pairs (a short prompt's 256-row grid piece then its 44-row tail back to back) are the SHORT rule's intent
+# and stay allowed: same class, both pieces of one prompt.
+# Source: found via an SGLang/vLLM scheduler comparison; the gate runs on the applied tree.
+# x23-id: 0972
+# x23-source: the red gate run (x21 state: S1a 24, S1b 12, gap 963 ms, short TTFT max 1.219 s)
+# x23-guard: MultiDecoder._group later-class admission in families/glm5_next/cuda/multi.py
+
+--- src/tensorfold/families/glm5_next/cuda/multi.py
++++ src/tensorfold/families/glm5_next/cuda/multi.py
+@@ -1530,7 +1530,7 @@
+             left = self._chunk_rows(first)
+             top = first.s.priority
+             rest = sorted((l for l in self.lanes.values() if plain(l) and l is not first
+-                           and (top > prio.INTERACTIVE or l.s.priority <= top)),
++                           and (top > prio.NORMAL or l.s.priority <= top)),
+                           key=lambda l: (l.s.priority, len(l.s.prompt) - l.st.pos, l.order))
+             lanes = [first] + rest
+         else:

@@ -3,13 +3,16 @@
 # Usage: ./scripts/install-overlay.sh /path/to/GLM-5.3-Flash-EXL3-4x-RTX-PRO-6000-TensorFold
 # What it does (idempotent):
 #   1. copies patches/*.patch into <recipe>/patches/extra/ (0909 mixed-bit load, 0910 vision-prefix resume,
-#      0921 tokenize without the GIL, 0923 fastokens prompt encoding);
+#      0921 tokenize without the GIL, 0923 fastokens prompt encoding, 0930 select-onepass, 0932 kept-entries
+#      share, 0933 name-priority, 0940/0941 prompt-cache tiers, 0970 cross-class time credit, 0972 group
+#      no-later-class, 0980 topk_v2, 0990 write-behind park);
 #      (commdata2338's engine patch is NOT fetched or shipped — licence unknown; see PINS.md and README "Optional")
 #   2. edits <recipe>/scripts/apply-patches.sh and prepare.sh: the strict patch count becomes 86 release + the
 #      number of files in patches/extra; pure line offsets are allowed for extra/ patches (fuzz never); no .orig files;
 #   3. installs scripts/local.sh (the tuned knobs) as <recipe>/scripts/local.sh if none exists; an existing one gets the
 #      TF_W1_FASTOKENS=1 line appended if it lacks it (without it patch 0923 stays off);
-#   4. sets the image tag to tensorfold-glm53:1.1.0-x14 and adds fastokens==0.3.2 to IMAGE_EXTRAS (patch 0923 imports it).
+#   4. sets the image tag to tensorfold-glm53:1.1.0-x25 and adds fastokens==0.3.2 and xxhash==3.5.0 to IMAGE_EXTRAS
+#      (0923 imports fastokens; the prompt-cache tiers checksum with xxh3_64).
 set -euo pipefail
 recipe=${1:?path to the Aevonix recipe checkout}
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -52,16 +55,23 @@ s = re.sub(r"== \d+ \)\) \|\| fail E_PATCHES 'This build requires exactly 86 rel
 open(pp, "w").write(s)
 cs = f"{recipe}/scripts/config.sh"
 s = open(cs).read()
-s = re.sub(r'IMAGE="\$\{IMAGE:-tensorfold-glm53:1\.1\.0(-[a-z0-9]+)?\}"', 'IMAGE="${IMAGE:-tensorfold-glm53:1.1.0-x14}"', s)
+s = re.sub(r'IMAGE="\$\{IMAGE:-tensorfold-glm53:1\.1\.0(-[a-z0-9]+)?\}"', 'IMAGE="${IMAGE:-tensorfold-glm53:1.1.0-x25}"', s)
 m = re.search(r"^IMAGE_EXTRAS='([^']*)'$", s, re.M)
 if not m: raise SystemExit(f"{cs}: IMAGE_EXTRAS line not found")
-if "fastokens==" not in m.group(1):
-    s = s[:m.start()] + f"IMAGE_EXTRAS='{m.group(1)} fastokens==0.3.2'" + s[m.end():]
+extras = m.group(1).split()
+if "fastokens==" not in m.group(1): extras.append("fastokens==0.3.2")
+if "xxhash==" not in m.group(1): extras.append("xxhash==3.5.0")
+s = s[:m.start()] + f"IMAGE_EXTRAS='{' '.join(extras)}'" + s[m.end():]
 open(cs, "w").write(s)
-print(f"edited apply-patches.sh / prepare.sh for 86 + {n} patches; image tag tensorfold-glm53:1.1.0-x14 (+ fastokens==0.3.2)")
+print(f"edited apply-patches.sh / prepare.sh for 86 + {n} patches; image tag tensorfold-glm53:1.1.0-x25 (+ fastokens==0.3.2 xxhash==3.5.0)")
 PY
 if [ -f "$recipe/scripts/local.sh" ]; then
   grep -q TF_W1_FASTOKENS "$recipe/scripts/local.sh" || grep -A0 -B1 '^export TF_W1_FASTOKENS' "$here/scripts/local.sh" >> "$recipe/scripts/local.sh"
+  # an older install (x14 or earlier) lacks the x15/x17/x18/x25 knobs: append any line present here but missing there
+  grep -vE '^\s*#|^\s*$' "$here/scripts/local.sh" | while IFS= read -r line; do
+    key=$(echo "$line" | sed -E 's/^export ([A-Za-z_0-9]+)=.*/\1/')
+    [ -n "$key" ] && ! grep -q "export $key=" "$recipe/scripts/local.sh" && echo "$line" >> "$recipe/scripts/local.sh"
+  done
 else
   cp "$here/scripts/local.sh" "$recipe/scripts/local.sh"
 fi
