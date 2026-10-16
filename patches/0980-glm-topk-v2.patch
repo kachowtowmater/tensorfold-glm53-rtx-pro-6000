@@ -1,0 +1,663 @@
+# root-relative: applied from the repository root (src/ paths).
+# 0980: the segmented decode selection (sparse.seg_select_tokens' split path,
+# select_split's five launches) by one CUDA kernel launch, behind TF_GLM_TOPK_V2=1 (default off:
+# unset, '' or 0 keeps the x23 path byte-identical). The kernel is SGLang's DeepSeek-v4 topk_v2
+# single-block radix select (python/sglang/kernels/jit/csrc/deepseek_v4/topk_v2.cuh and
+# .../jit/include/sgl_kernel/deepseek_v4/topk_impl.cuh at commit 5b12ec1, Apache-2.0, SGLang
+# project; itself adapted from vLLM persistent_topk.cuh and flashinfer topk.cuh) ported to the
+# recipe's order-key selection (_order_key, -0 as +0): a coarse 12-bit histogram pass of the
+# order keys (registers for rows to 8192 pools, their Register2 path; else streamed), threshold
+# bin, one classify pass (above the bin selected, the bin staged as a 40-bit key|~pool composite),
+# the staged ties resolved exactly by an 8-bit radix select (their radix_tie_select; refine_ties
+# re-scans the row when the bin overflows 2048), then our emit: the 512 ids ranked ascending in
+# shared memory, each kept pool's 4 tokens in pool order, the incomplete pool's visible tail and
+# count (select_split's SEG contract: ties to the lower pool, ascending output, rows of <= 512
+# pools all their tokens and count 0, dense rows count 0 and untouched tokens). 1024 threads a row,
+# launch_bounds(1024,1), no clusters, no page table, no plan; per-row length read from rows.pos
+# on the device (graph-safe: no host sync). New families/glm5_next/cuda/topk_v2.py (on() reads
+# the flag per call, _ext() builds through tensorfold.cuda.build.load, seg_select the same
+# output contract with select_split fallback on shapes the kernel does not take, self_check a
+# test helper comparing the kernel with select_split byte for byte on synthetic windows (never
+# called by the routing), TF_GLM_TOPK_V2_CHECK=1 compares every call),
+# topk_v2.cu (the kernel) and topk_v2.cpp (the binding); sparse.py's seg_select_tokens routes
+# the SEG_SPLIT selection through it when on().
+# Source: SGLang 5b12ec163c00a852d606b6dd521ebef8d2dbdabf deepseek_v4 topk_v2 (see above).
+# x24-id: 0980
+# x24-flag: TF_GLM_TOPK_V2
+# x24-source: SGLang 5b12ec163c00a852d606b6dd521ebef8d2dbdabf python/sglang/kernels/jit (topk_v2.cuh, topk_impl.cuh)
+
+diff --git src/tensorfold/families/glm5_next/cuda/topk_v2.py src/tensorfold/families/glm5_next/cuda/topk_v2.py
+new file mode 100644
+--- /dev/null
++++ src/tensorfold/families/glm5_next/cuda/topk_v2.py
+@@ -0,0 +1,207 @@
++"""TF_GLM_TOPK_V2=1 (patch 0980): the segmented decode selection (``sparse.seg_select_tokens``'s split path,
++``select_split``'s five launches) by one CUDA kernel launch (``topk_v2.cu``), SGLang's DeepSeek-v4 topk_v2 kernel
++(sgl_kernel/deepseek_v4/topk_impl.cuh: the single-block radix select) ported to the order-key selection the recipe
++already uses.
++
++The contract is sparse.select_split's SEG path exactly, a function of the scores and the SegRows tables alone:
++- each sparse row (``sparse[r] != 0``) attends its ``npool = (pos[r] + 1) // 4`` visible pools; scores past them are
++  -inf with the highest indices (``_seg_scores`` writes only visible columns), and the columns a window's power-of-two
++  bucket scores past them rank below every kept pool, so the K = 512 best of the visible pools are the K best of the
++  row (the same argument _visible_bound makes);
++- selection by uint32 order keys (_order_key: -0 counted as +0), ties to the lower pool, output in ascending pool
++  order: _select_rows' semantics, held by select_split;
++- tokens: the K pools' 4 tokens each ascending, then the incomplete pool's visible tokens (npool * 4 .. pos), the
++  rest -1; counts: K * 4 + visible tail for npool > K, else 0; dense rows get count 0 and untouched tokens
++  (select_split writes only their count);
++- rows without segments behind them (``pos`` < SPARSE_FROM) are dense by ``sparse`` and never reach the kernel's
++  selection (the same tables the Triton path reads).
++
++The kernel is SGLang's coarse 12-bit histogram pass + threshold + fp32 tie handling + exact radix tie select (their
++device::topk impl, 1024 threads, one block a row), with their per-element emit replaced by the pool-to-token write.
++No clusters, no page table, no plan: a decode window holds at most a few hundred rows, one block each fills the GPU,
++and the selection is a function of the row alone. Default off: TF_GLM_TOPK_V2 unset or 0 keeps x23 exactly (P2: the
++flag routes and nothing else changes); '1' routes seg_select_tokens through seg_select below.
++self_check(device) compares the kernel with select_split byte for byte on synthetic windows covering ties, signed
++zeros, NaN/inf and ragged lengths (a test helper; the routing never calls it, so CUDA graph capture stays clean).
++TF_GLM_TOPK_V2_CHECK=1 compares every call (a test setting; it allocates, so not under graph capture).
++
++Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
++the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab; the kernel is a port of sglang's
++sgl-kernel deepseek_v4 topk_v2.cuh (Apache-2.0, SGLang project)."""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++from .sparse import POOL, SPARSE_FROM, TOKENS, TOPK_POOLS
++
++K = TOPK_POOLS
++
++_EXT = None
++
++
++def _flag() -> bool:
++    """TF_GLM_TOPK_V2: 1 routes the decode selection through seg_select; unset, '' or 0 the x23 path."""
++    value = (os.environ.get("TF_GLM_TOPK_V2", "") or "0").strip()
++    if value not in ("0", "1"):
++        raise ValueError(f"TF_GLM_TOPK_V2: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++def _check_flag() -> bool:
++    value = (os.environ.get("TF_GLM_TOPK_V2_CHECK", "") or "0").strip()
++    if value not in ("0", "1"):
++        raise ValueError(f"TF_GLM_TOPK_V2_CHECK: 0 or 1, not {value!r}")
++    return value == "1"
++
++
++def on() -> bool:
++    return _flag()
++
++
++def _ext():
++    global _EXT
++    if _EXT is None:
++        from functools import lru_cache
++        from pathlib import Path
++
++        from tensorfold.cuda.build import load
++
++        here = Path(__file__).parent
++
++        @lru_cache(maxsize=1)
++        def build():
++            return load(name="tensorfold_glm_topk_v2_v1",
++                        sources=[str(here / "topk_v2.cu"), str(here / "topk_v2.cpp")],
++                        extra_cuda_cflags=["-O3"], verbose=False)
++
++        _EXT = build
++    return _EXT()
++
++
++def applies(scores: torch.Tensor) -> bool:
++    """The kernel's shapes: contiguous fp32 [R, NP] rows on the GPU, NP from K to 2^20 (any alignment)."""
++    return (scores.is_cuda and scores.dtype == torch.float32 and scores.dim() == 2 and scores.is_contiguous()
++            and K <= scores.shape[1] <= 1 << 20)
++
++
++_FELL_BACK: set = set()
++
++
++def seg_select(scores: torch.Tensor, k: int, *, rows, tokens, counts) -> None:
++    """select_split's SEG contract by the kernel: ``rows`` (segments.SegRows), ``tokens`` [R, TOKENS] and
++    ``counts`` [R] int32 written in place. A shape the kernel does not take falls back to select_split with one
++    line a kind of shape; it never raises on a shape."""
++    R, NP = scores.shape
++    if not applies(scores) or k != K or tokens.shape[0] < R or tokens.shape[1] != TOKENS or counts.shape[0] < R \
++            or not tokens.is_contiguous() or not counts.is_contiguous() or not scores.device == rows.pos.device:
++        why = (str(scores.device.type), str(scores.dtype), scores.dim(), bool(scores.is_contiguous()), k, R, NP,
++               tuple(tokens.shape), bool(tokens.is_contiguous()))
++        if why not in _FELL_BACK:
++            _FELL_BACK.add(why)
++            print(f"[tensorfold] topk_v2: scores {tuple(scores.shape)} k {k} tokens {tuple(tokens.shape)}: not the "
++                  "kernel's shape, select_split runs", flush=True)
++        from . import sparse
++
++        sparse.select_split(scores, k, rows=rows, tokens=tokens, counts=counts)
++        return
++    _ext().seg_select(scores, scores.stride(0), rows.pos, rows.sparse, tokens, counts, NP)
++    if _check_flag():
++        t0 = tokens.clone()
++        c0 = counts.clone()
++        reference(scores, k, rows=rows, tokens=t0, counts=c0)
++        if not torch.equal(tokens, t0) or not torch.equal(counts, c0):
++            raise RuntimeError("TF_GLM_TOPK_V2_CHECK: the kernel's tokens or counts differ from select_split's")
++
++
++def reference(scores: torch.Tensor, k: int, *, rows, tokens, counts) -> None:
++    """select_split on the same inputs (the comparison's right side)."""
++    from . import sparse
++
++    sparse.select_split(scores, k, rows=rows, tokens=tokens, counts=counts)
++
++
++def self_check(device) -> bool:
++    """The kernel against select_split on synthetic windows: rows of every kind (ties, signed zeros, NaN/inf,
++    ragged lengths, dense rows), byte for byte."""
++    from . import segments as segm
++    from . import sparse
++
++    gen = torch.Generator(device=device).manual_seed(980)
++    lens = (512, 513, 4096, 8192, 16385, 65536, 262144)
++    kinds = ("randn", "all_equal", "pm_zero", "tie4096", "bf16_ties", "nan_inf", "neg_inf_head")
++    for R in (1, 3, 16, 64):
++        for seed in range(2):
++            spans, pos, rs = [], [], []
++            base = 0
++            for i in range(R):
++                L = lens[(i + seed) % len(lens)]
++                kind = kinds[(i + 2 * seed) % len(kinds)]
++                q = 4 * L - 1 + (i + seed) % 4
++                pos.append(q)
++                spans.append((base, q, 1))
++                base += (-(-(q + 1) // segm.EXTENT) + 1) * segm.EXTENT
++                if kind == "randn":
++                    s = torch.randn(L, device=device, generator=gen)
++                elif kind == "all_equal":
++                    s = torch.full((L,), 1.5, device=device)
++                elif kind == "pm_zero":
++                    s = torch.zeros(L, device=device)
++                    s[torch.randperm(L, device=device, generator=gen)[: L // 2]] = -0.0
++                    s[torch.randperm(L, device=device, generator=gen)[: min(100, L // 8)]] = 2.0
++                elif kind == "tie4096":
++                    s = torch.rand(L, device=device, generator=gen) - 1.5
++                    idx = torch.randperm(L, device=device, generator=gen)
++                    s[idx[: min(300, L // 4)]] = 5.0
++                    s[idx[min(300, L // 4): min(300, L // 4) + min(4096, L - L // 4)]] = 1.0
++                elif kind == "bf16_ties":
++                    s = (torch.randn(L, device=device, generator=gen) * 0.05).to(torch.bfloat16).float()
++                elif kind == "nan_inf":
++                    s = torch.randn(L, device=device, generator=gen)
++                    j = torch.randperm(L, device=device, generator=gen)[:8]
++                    s[j[0]], s[j[1]], s[j[2]], s[j[3]] = float("nan"), -float("nan"), float("inf"), -float("inf")
++                    s[j[4]] = -0.0
++                else:
++                    s = torch.randn(L, device=device, generator=gen)
++                    s[: L // 4] = float("-inf")                     # -inf-heavy: the bucket's dead columns
++                rs.append(s)
++            rows = segm.SegRows(R, device, max_segs=max(segm.MAX_SEGS, R))
++            rows.set(spans)
++            sel = segm.SelectScratch(R, max(4 * max(lens), 32768), device)
++            sel.scores[:, : max(4 * max(lens), 32768)] = 0.0
++            for r, s in enumerate(rs):
++                sel.scores[r, :s.numel()] = s
++                sel.scores[r, s.numel():] = float("-inf")
++            NP = sel.scores.shape[1]
++            scores = sel.scores[:R, :NP]
++            t1 = torch.full((R, TOKENS), -1, dtype=torch.int32, device=device)
++            c1 = torch.full((R,), -7, dtype=torch.int32, device=device)
++            seg_select(scores, K, rows=rows, tokens=t1, counts=c1)
++            t0 = torch.full((R, TOKENS), -1, dtype=torch.int32, device=device)
++            c0 = torch.full((R,), -7, dtype=torch.int32, device=device)
++            sparse.select_split(scores, K, rows=rows, tokens=t0, counts=c0)
++            if not torch.equal(t1, t0) or not torch.equal(c1, c0):
++                return False
++    return True
++
++
++_DECIDED: bool | None = None
++
++
++def checked(device) -> bool:
++    """The setting, and its check passed on this GPU (the first call of the process compares once)."""
++    global _DECIDED
++    if not _flag():
++        return False
++    if _DECIDED is None:
++        try:
++            ok = self_check(device)
++            why = "" if ok else ": its tokens differ from select_split's on this GPU"
++        except Exception as exc:  # noqa: BLE001 - a kernel that cannot run here is off; select_split runs
++            ok, why = False, f": {type(exc).__name__}: {str(exc).splitlines()[0][:160] if str(exc) else ''}"
++        _DECIDED = ok
++        print(f"[tensorfold] topk_v2 decode selection: {'on (checked against select_split)' if ok else 'off' + why}",
++              flush=True)
++    return _DECIDED
+diff --git src/tensorfold/families/glm5_next/cuda/topk_v2.cu src/tensorfold/families/glm5_next/cuda/topk_v2.cu
+new file mode 100644
+--- /dev/null
++++ src/tensorfold/families/glm5_next/cuda/topk_v2.cu
+@@ -0,0 +1,371 @@
++// TF_GLM_TOPK_V2=1 (patch 0980): the segmented decode selection (sparse.seg_select_tokens' split path,
++// sparse.select_split's SEG contract) by one kernel launch: SGLang's DeepSeek-v4 topk_v2 single-block radix select
++// (sgl-kernel include/sgl_kernel/deepseek_v4/topk_impl.cuh + csrc/deepseek_v4/topk_v2.cuh, Apache-2.0) ported to the
++// recipe's order-key selection. The five-launch Triton split (_select_split) becomes this one launch.
++//
++// One block of 1024 threads per row (launch_bounds(1024, 1), SGLang's kBlockSize / kOccupancy = 1, no clusters):
++//   1. a 12-bit coarse histogram of the uint32 order keys (sparse._order_key: s + 0.0, so -0 counts as +0), read
++//      from registers for rows of at most 8192 pools (SGLang's Register2 path: one read) or streamed from the row
++//      (SGLang's Streaming path); the threshold bin T holds the K-th best key;
++//   2. one classify pass: keys above bin T are selected, keys in bin T are staged in shared memory as a 40-bit
++//      composite (the key's low 20 bits, then 0xFFFFF - pool) whose order is select_split's order exactly (higher
++//      score first, ties to the lower pool) and which is unique per pool;
++//   3. the staged ties resolved exactly by an 8-bit radix select over the composite (SGLang's radix_tie_select);
++//      when bin T holds more than 2048 pools the row is re-scanned 8 composite bits at a time (SGLang's
++//      refine_ties) until the candidates fit the staging buffer, then staged and resolved the same way;
++//   4. the K selected pool ids (staged in shared memory) are ranked ascending (each id's rank = the ids below it)
++//      and written as tokens pool * 4 + j in pool order, then the incomplete pool's visible tail (npool * 4 .. pos,
++//      -1 padded) and count K * 4 + tail: _select_split's SEG epilogue. A row with npool <= K writes all its pools'
++//      tokens, the tail and count 0 (as _select_split does); a dense row (sparse[r] == 0) gets count 0 and its
++//      tokens untouched.
++// Per-row length npool = (pos[r] + 1) / 4 is read on the device (graph-safe: no host sync, grid = R).
++//
++// Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors)
++// and on the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab; the kernel is a port of sglang's deepseek_v4
++// topk_v2.cuh (SGLang project, Apache-2.0).
++
++#include <ATen/ATen.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++namespace {
++
++constexpr int KTOP = 512;                  // pools a row keeps (TOPK_POOLS)
++constexpr int POOL = 4;                    // tokens a pool holds
++constexpr int TOKW = KTOP * POOL + POOL - 1;  // a row's token slots (sparse.TOKENS = 2051)
++constexpr int THREADS = 1024;              // SGLang TopKConfig::kBlockSize
++constexpr int WARPS = THREADS / 32;
++constexpr int HBITS = 12;                  // coarse histogram bits (SGLang TopKRadixBase<12>)
++constexpr int HSIZE = 1 << HBITS;
++constexpr int HITEMS = HSIZE / THREADS;    // coarse bins a thread owns in the threshold scan
++constexpr int LOWBITS = 32 - HBITS;        // order-key bits below the coarse bin
++constexpr unsigned IDMASK = (1u << 20) - 1u;  // pool ids below 2^20
++constexpr int RTOP = 2048;                 // staged ties cap (SGLang kMaxNumTie)
++constexpr int SITEMS = RTOP / THREADS;     // staged ties a thread holds
++constexpr int REG_ITEMS = 8;               // SGLang Register2: rows of at most 8192 pools kept in registers
++constexpr unsigned REG_MAX = REG_ITEMS * THREADS;
++constexpr unsigned FULL = 0xFFFFFFFFu;
++
++// ---- the recipe's order key (sparse._order_key: -0 counted as +0, unsigned order = score order) ----
++__device__ __forceinline__ unsigned order_key(float s) {
++    float z;
++    asm("add.rn.f32 %0, %1, 0f00000000;" : "=f"(z) : "f"(s));
++    const unsigned u = __float_as_uint(z);
++    return u ^ (static_cast<unsigned>(static_cast<int>(u) >> 31) | 0x80000000u);
++}
++
++// 40-bit composite over a coarse bin: higher = selected first (higher key, then lower pool); unique per pool.
++__device__ __forceinline__ unsigned long long composite(unsigned key, unsigned idx) {
++    return (static_cast<unsigned long long>(key & ((1u << LOWBITS) - 1u)) << 20) |
++           static_cast<unsigned long long>(IDMASK - idx);
++}
++__device__ __forceinline__ unsigned comp_idx(unsigned long long c) {
++    return IDMASK - static_cast<unsigned>(c & IDMASK);
++}
++
++// ---- shared memory (types declared outside the union) ----
++struct Scalars {
++    unsigned n_sel, n_stage;               // selected ids, staged ties
++    unsigned thr, above, equal;            // a threshold search's bin, count above it, count in it
++};
++struct SortArea {
++    unsigned rank[2][KTOP];                // partial ranks (two halves of the comparison)
++    unsigned sorted[KTOP];                 // the selected ids, ascending
++};
++union BigArea {
++    unsigned hist[HSIZE];                  // 16 KB coarse histogram
++    unsigned long long stage[RTOP];        // 16 KB staged ties (composites)
++    SortArea sort;                         // 6 KB, after the selection
++};
++struct Smem {
++    Scalars s;
++    unsigned warp_sum[WARPS];
++    unsigned h256[256];
++    unsigned sel[KTOP];
++    BigArea big;
++};
++
++// ---- warp / block scans over all 1024 threads (every thread calls; contain __syncthreads) ----
++__device__ __forceinline__ unsigned w_incl(unsigned v, int lane) {
++#pragma unroll
++    for (int d = 1; d < 32; d <<= 1) {
++        const unsigned y = __shfl_up_sync(FULL, v, d);
++        if (lane >= d) v += y;
++    }
++    return v;
++}
++
++// exclusive prefix of v over threadIdx.x order
++__device__ __forceinline__ unsigned block_excl(unsigned v, unsigned* wsum, int lane, int warp) {
++    const unsigned inc = w_incl(v, lane);
++    if (lane == 31) wsum[warp] = inc;
++    __syncthreads();
++    const unsigned w = wsum[lane];                  // WARPS == 32: one warp total a lane
++    const unsigned wi = w_incl(w, lane);
++    const unsigned pre = __shfl_sync(FULL, wi - w, warp);
++    __syncthreads();                                // wsum reusable
++    return pre + inc - v;
++}
++
++// The 256-bin digit search: the digit d with count(digits > d) < need <= count(digits >= d). Writes s.thr,
++// s.above, s.equal; every thread calls.
++__device__ __forceinline__ void find_digit(Smem& sm, unsigned need, int tid, int lane, int warp) {
++    const unsigned v = tid < 256 ? sm.h256[255 - tid] : 0u;
++    const unsigned ge_before = block_excl(v, sm.warp_sum, lane, warp);   // count of digits above 255 - tid
++    if (tid < 256 && ge_before < need && ge_before + v >= need) {
++        sm.s.thr = 255u - static_cast<unsigned>(tid);
++        sm.s.above = ge_before;
++        sm.s.equal = v;
++    }
++    __syncthreads();
++}
++
++// Visit every visible score of the row: f(pool, score). Register path (ITEMS > 0): v[] holds pool tid + j * 1024.
++template <int ITEMS, bool VEC, typename F>
++__device__ __forceinline__ void for_each(const float* __restrict__ row, unsigned n, const float (&v)[REG_ITEMS],
++                                         int tid, F&& f) {
++    if constexpr (ITEMS > 0) {
++#pragma unroll
++        for (int j = 0; j < ITEMS; ++j) {
++            const unsigned i = static_cast<unsigned>(tid) + static_cast<unsigned>(j) * THREADS;
++            if (i < n) f(i, v[j]);
++        }
++    } else {
++        unsigned i0 = 0;
++        if constexpr (VEC) {
++            const unsigned nv = n / 4;
++            const float4* r4 = reinterpret_cast<const float4*>(row);
++            for (unsigned q = tid; q < nv; q += THREADS) {
++                const float4 x = r4[q];
++                f(q * 4 + 0, x.x);
++                f(q * 4 + 1, x.y);
++                f(q * 4 + 2, x.z);
++                f(q * 4 + 3, x.w);
++            }
++            i0 = nv * 4;
++        }
++        for (unsigned i = i0 + tid; i < n; i += THREADS) f(i, row[i]);
++    }
++}
++
++// Resolve the staged ties: select `need` of the m staged composites (all sharing their bits at and above `sh`)
++// by an 8-bit radix select over the bits below `sh`. Uniform arguments; every thread calls.
++__device__ __forceinline__ void resolve_staged(Smem& sm, unsigned m, unsigned need, int sh, int tid, int lane,
++                                               int warp) {
++    unsigned long long c[SITEMS];
++    bool active[SITEMS];
++#pragma unroll
++    for (int i = 0; i < SITEMS; ++i) {
++        const unsigned t = static_cast<unsigned>(tid) + static_cast<unsigned>(i) * THREADS;
++        active[i] = t < m;
++        c[i] = active[i] ? sm.big.stage[t] : 0ull;
++    }
++    __syncthreads();                       // stage[] read before anything overlays it
++    bool all = need >= m;
++#pragma unroll 1
++    for (int s = sh - 8; !all && s >= 0; s -= 8) {
++        if (tid < 256) sm.h256[tid] = 0;
++        __syncthreads();
++#pragma unroll
++        for (int i = 0; i < SITEMS; ++i)
++            if (active[i]) atomicAdd(&sm.h256[static_cast<unsigned>(c[i] >> s) & 0xFFu], 1u);
++        __syncthreads();
++        find_digit(sm, need, tid, lane, warp);
++        const unsigned d = sm.s.thr, above = sm.s.above, equal = sm.s.equal;
++        all = above + equal == need;       // every candidate at or above d is selected
++#pragma unroll
++        for (int i = 0; i < SITEMS; ++i) {
++            if (!active[i]) continue;
++            const unsigned dig = static_cast<unsigned>(c[i] >> s) & 0xFFu;
++            if (dig > d || (all && dig == d)) {
++                sm.sel[atomicAdd(&sm.s.n_sel, 1u)] = comp_idx(c[i]);
++                active[i] = false;
++            } else if (dig < d) {
++                active[i] = false;
++            }
++        }
++        need -= above;
++        __syncthreads();                   // h256 / s.thr reusable
++    }
++    if (all) {                             // the remaining candidates are exactly the ones still needed
++#pragma unroll
++        for (int i = 0; i < SITEMS; ++i)
++            if (active[i]) sm.sel[atomicAdd(&sm.s.n_sel, 1u)] = comp_idx(c[i]);
++    }
++    __syncthreads();
++}
++
++template <int ITEMS, bool VEC>
++__device__ __forceinline__ void select_row(Smem& sm, const float* __restrict__ row, unsigned n, int tid, int lane,
++                                           int warp) {
++    float v[REG_ITEMS];
++#pragma unroll
++    for (int j = 0; j < REG_ITEMS; ++j) {
++        const unsigned i = static_cast<unsigned>(tid) + static_cast<unsigned>(j) * THREADS;
++        v[j] = (ITEMS > 0 && j < ITEMS && i < n) ? row[i] : 0.0f;
++    }
++
++    // 1. coarse histogram, threshold bin T (count(bins > T) < K <= count(bins >= T))
++    for (int i = tid; i < HSIZE; i += THREADS) sm.big.hist[i] = 0;
++    if (tid == 0) { sm.s.n_sel = 0; sm.s.n_stage = 0; }
++    __syncthreads();
++    for_each<ITEMS, VEC>(row, n, v, tid, [&](unsigned, float x) {
++        atomicAdd(&sm.big.hist[order_key(x) >> LOWBITS], 1u);
++    });
++    __syncthreads();
++    {
++        unsigned b[HITEMS], local = 0;      // thread tid owns bins HSIZE-1-4*tid .. HSIZE-4-4*tid (descending)
++#pragma unroll
++        for (int i = 0; i < HITEMS; ++i) { b[i] = sm.big.hist[HSIZE - 1 - (tid * HITEMS + i)]; local += b[i]; }
++        unsigned ge = block_excl(local, sm.warp_sum, lane, warp);
++#pragma unroll
++        for (int i = 0; i < HITEMS; ++i) {
++            if (ge < static_cast<unsigned>(KTOP) && ge + b[i] >= static_cast<unsigned>(KTOP)) {
++                sm.s.thr = static_cast<unsigned>(HSIZE - 1 - (tid * HITEMS + i));
++                sm.s.above = ge;
++                sm.s.equal = b[i];
++            }
++            ge += b[i];
++        }
++        __syncthreads();
++    }
++    const unsigned T = sm.s.thr;
++    unsigned need = KTOP - sm.s.above;     // >= 1
++    unsigned cand = sm.s.equal;            // pools in bin T
++    __syncthreads();                       // hist is overlaid by stage[] below
++
++    // 2. classify: above T selected, bin T staged (composites compared at bits >= sh against pfx)
++    int sh = 40;
++    unsigned long long pfx = 0;
++    if (cand > static_cast<unsigned>(RTOP)) {
++        // SGLang refine_ties: narrow bin T 8 composite bits a pass until its candidates fit the staging buffer
++#pragma unroll 1
++        while (cand > static_cast<unsigned>(RTOP) && sh > 0) {
++            sh -= 8;
++            if (tid < 256) sm.h256[tid] = 0;
++            __syncthreads();
++            const int hs = sh + 8;
++            const unsigned long long hp = pfx >> hs;
++            for_each<ITEMS, VEC>(row, n, v, tid, [&](unsigned i, float x) {
++                const unsigned key = order_key(x);
++                if ((key >> LOWBITS) != T) return;
++                const unsigned long long c = composite(key, i);
++                if ((c >> hs) == hp) atomicAdd(&sm.h256[static_cast<unsigned>(c >> sh) & 0xFFu], 1u);
++            });
++            __syncthreads();
++            find_digit(sm, need, tid, lane, warp);
++            pfx |= static_cast<unsigned long long>(sm.s.thr) << sh;
++            need -= sm.s.above;
++            cand = sm.s.equal;
++            __syncthreads();
++        }
++    }
++    {
++        const unsigned long long sp = pfx >> sh;   // sh == 40: every bin-T pool staged
++        for_each<ITEMS, VEC>(row, n, v, tid, [&](unsigned i, float x) {
++            const unsigned key = order_key(x);
++            const unsigned bin = key >> LOWBITS;
++            if (bin > T) {
++                sm.sel[atomicAdd(&sm.s.n_sel, 1u)] = i;
++            } else if (bin == T) {
++                const unsigned long long c = composite(key, i) >> sh;
++                if (c > sp) {
++                    sm.sel[atomicAdd(&sm.s.n_sel, 1u)] = i;
++                } else if (c == sp) {
++                    const unsigned slot = atomicAdd(&sm.s.n_stage, 1u);
++                    if (slot < static_cast<unsigned>(RTOP)) sm.big.stage[slot] = composite(key, i);
++                }
++            }
++        });
++        __syncthreads();
++    }
++
++    // 3. the staged candidates (cand <= RTOP of them): exactly `need` more
++    resolve_staged(sm, cand, need, sh, tid, lane, warp);
++}
++
++// ---- one block a row ----
++template <bool VEC>
++__global__ void __launch_bounds__(THREADS, 1) seg_select_kernel(
++    const float* __restrict__ scores, int64_t s_stride, const int* __restrict__ pos, const int* __restrict__ sparse,
++    int* __restrict__ tok, int* __restrict__ cnt, unsigned np_max) {
++    __shared__ Smem sm;
++    const int r = blockIdx.x;
++    const int tid = static_cast<int>(threadIdx.x);
++    if (sparse[r] == 0) {                  // a dense row: count 0, tokens untouched (select_split's SEG)
++        if (tid == 0) cnt[r] = 0;
++        return;
++    }
++    const int qpos = pos[r];
++    const unsigned npool = static_cast<unsigned>(qpos + 1) / POOL;
++    const unsigned n = npool < np_max ? npool : np_max;   // the scored columns (npool <= np_max in the recipe)
++    const float* row = scores + static_cast<int64_t>(r) * s_stride;
++    int* tokens = tok + static_cast<int64_t>(r) * TOKW;
++    const int lane = tid & 31, warp = tid >> 5;
++
++    if (n <= static_cast<unsigned>(KTOP)) {
++        // every visible pool kept, in pool order (select_split takes them all; count stays 0 below)
++        for (unsigned t = tid; t < n * POOL; t += THREADS) tokens[t] = static_cast<int>(t);
++    } else {
++        if (n <= REG_MAX) select_row<REG_ITEMS, VEC>(sm, row, n, tid, lane, warp);
++        else select_row<0, VEC>(sm, row, n, tid, lane, warp);
++        // 4. rank the K selected ids ascending (ids unique), then write their tokens in pool order
++        {
++            const unsigned i = static_cast<unsigned>(tid) & (KTOP - 1);
++            const unsigned half = static_cast<unsigned>(tid) / KTOP;
++            const unsigned me = sm.sel[i];
++            unsigned below = 0;
++#pragma unroll 8
++            for (unsigned j = half * (KTOP / 2); j < (half + 1) * (KTOP / 2); ++j) below += sm.sel[j] < me ? 1u : 0u;
++            sm.big.sort.rank[half][i] = below;
++            __syncthreads();
++            if (tid < KTOP) sm.big.sort.sorted[sm.big.sort.rank[0][tid] + sm.big.sort.rank[1][tid]] = sm.sel[tid];
++            __syncthreads();
++        }
++        for (int t = tid; t < KTOP * POOL; t += THREADS)
++            tokens[t] = static_cast<int>(sm.big.sort.sorted[t / POOL] * POOL + static_cast<unsigned>(t % POOL));
++    }
++
++    // the incomplete pool's visible tail and the count (_select_split's c == 0 epilogue)
++    if (tid == 0) {
++        int* tail = tokens + KTOP * POOL;
++        const long long np4 = static_cast<long long>(npool) * POOL;
++        int ntail = 0;
++#pragma unroll
++        for (int j = 0; j < POOL - 1; ++j) {
++            const long long t = np4 + j;
++            const bool ok = t <= static_cast<long long>(qpos);
++            tail[j] = ok ? static_cast<int>(t) : -1;
++            ntail += ok ? 1 : 0;
++        }
++        cnt[r] = npool > static_cast<unsigned>(KTOP) ? KTOP * POOL + ntail : 0;
++    }
++}
++
++}  // namespace
++
++// scores [R, NP] fp32 (row stride s_stride), pos/sparse the SegRows tables ([>= R] int32 each); tok [>= R, 2051]
++// int32 contiguous, cnt [>= R] int32.
++void seg_select_cuda(const at::Tensor& scores, int64_t s_stride, const at::Tensor& pos, const at::Tensor& sparse,
++                     const at::Tensor& tok, const at::Tensor& cnt, int64_t np_max) {
++    const int64_t R = scores.size(0);
++    TORCH_CHECK(np_max >= 1 && np_max <= (1LL << 20), "topk_v2: rows of 1 to 2^20 pools");
++    TORCH_CHECK(R <= pos.size(0) && R <= sparse.size(0) && R <= tok.size(0) && R <= cnt.size(0),
++                "topk_v2: pos, sparse, tok and cnt need a row each");
++    if (R == 0) return;
++    c10::cuda::CUDAGuard guard(scores.device());
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const float* s = scores.data_ptr<float>();
++    const bool vec = s_stride % 4 == 0 && reinterpret_cast<uintptr_t>(s) % 16 == 0;
++    const dim3 grid(static_cast<unsigned>(R));
++    if (vec) {
++        seg_select_kernel<true><<<grid, THREADS, 0, stream>>>(s, s_stride, pos.data_ptr<int>(),
++            sparse.data_ptr<int>(), tok.data_ptr<int>(), cnt.data_ptr<int>(), static_cast<unsigned>(np_max));
++    } else {
++        seg_select_kernel<false><<<grid, THREADS, 0, stream>>>(s, s_stride, pos.data_ptr<int>(),
++            sparse.data_ptr<int>(), tok.data_ptr<int>(), cnt.data_ptr<int>(), static_cast<unsigned>(np_max));
++    }
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff --git src/tensorfold/families/glm5_next/cuda/topk_v2.cpp src/tensorfold/families/glm5_next/cuda/topk_v2.cpp
+new file mode 100644
+--- /dev/null
++++ src/tensorfold/families/glm5_next/cuda/topk_v2.cpp
+@@ -0,0 +1,28 @@
++// Bindings of topk_v2.cu (TF_GLM_TOPK_V2=1, patch 0980): the segmented decode selection (sparse.seg_select_tokens'
++// split path) by one kernel launch — SGLang's DeepSeek-v4 topk_v2 single-block radix select ported to the recipe's
++// order-key selection. sparse.py's hook calls topk_v2.seg_select; the extension is built by topk_v2._ext().
++#include <torch/extension.h>
++#include <c10/cuda/CUDAGuard.h>
++
++void seg_select_cuda(const at::Tensor& scores, int64_t s_stride, const at::Tensor& pos, const at::Tensor& sparse,
++                     const at::Tensor& tok, const at::Tensor& cnt, int64_t np_max);
++
++// scores [R, NP] fp32 (contiguous rows, NP the scratch's pools), pos/sparse the SegRows tables ([R] int32 each),
++// tok [R, 2051] int32 (its sentinel -1 pre-staged; dense rows' tokens untouched), cnt [R] int32 (dense rows 0).
++void seg_select(const at::Tensor& scores, int64_t s_stride, const at::Tensor& pos, const at::Tensor& sparse,
++                const at::Tensor& tok, const at::Tensor& cnt, int64_t np_max) {
++    TORCH_CHECK(scores.is_cuda() && scores.scalar_type() == at::kFloat && scores.dim() == 2 && scores.is_contiguous(),
++                "topk_v2: contiguous fp32 scores [R, NP]");
++    TORCH_CHECK(scores.size(1) >= 512 && scores.size(1) <= (1LL << 20), "topk_v2: rows of 512 to 2^20 pools");
++    TORCH_CHECK(pos.is_cuda() && pos.scalar_type() == at::kInt && sparse.is_cuda() && sparse.scalar_type() == at::kInt,
++                "topk_v2: int32 SegRows pos and sparse");
++    TORCH_CHECK(tok.is_cuda() && tok.scalar_type() == at::kInt && tok.size(1) == 512 * 4 + 3 && tok.is_contiguous(),
++                "topk_v2: tok [R, 2051] int32 contiguous");
++    TORCH_CHECK(cnt.is_cuda() && cnt.scalar_type() == at::kInt && cnt.is_contiguous(), "topk_v2: cnt [R] int32");
++    TORCH_CHECK(np_max == scores.size(1) && s_stride == scores.stride(0), "topk_v2: np_max and s_stride of scores");
++    seg_select_cuda(scores, s_stride, pos, sparse, tok, cnt, np_max);
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("seg_select", &seg_select);
++}
+diff --git src/tensorfold/families/glm5_next/cuda/sparse.py src/tensorfold/families/glm5_next/cuda/sparse.py
+--- src/tensorfold/families/glm5_next/cuda/sparse.py
++++ src/tensorfold/families/glm5_next/cuda/sparse.py
+@@ -816,6 +816,10 @@ def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, row
+                                        G=grid, RS=rs, FP8=fp8, num_warps=4)
+     tokens, counts = scratch.tokens[:R], scratch.counts[:R]
+     if SEG_SPLIT:
++        from . import topk_v2
++        if topk_v2.on():      # TF_GLM_TOPK_V2=1 (patch 0980): the fused kernel, one launch, same contract
++            topk_v2.seg_select(scores[:R], TOPK_POOLS, rows=rows, tokens=tokens, counts=counts)
++            return tokens, counts
+         select_split(scores[:R], TOPK_POOLS, scratch=scratch.split, rows=rows, tokens=tokens, counts=counts)
+         return tokens, counts
+     _seg_select[(R,)](scores, scores.stride(0), rows.pos, rows.sparse, tokens, counts, W=TOKENS, K=TOPK_POOLS,

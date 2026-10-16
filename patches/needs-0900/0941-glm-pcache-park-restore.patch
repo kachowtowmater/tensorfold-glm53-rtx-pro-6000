@@ -1,0 +1,367 @@
+# (D-B): wire 0940's prompt-cache tiers into the engine — kept prompts parked on disk when evicted
+# (TF_GLM_MULTI_PARK, TF_GLM_DISK_CACHE) and restored into a cold lane at admission. Aevonix 261/262/264/266's
+# multi/engine hunks, adapted: our _admitted runs on both ranks (rank 1 via the ADMIT dispatch), so the disk lookup
+# sits in admit() (rank 0 only) and rank 1 applies a RESTORE op; no PagedSection/paged_cp here (cp=1), so
+# decode._saved_views grows a paged_io flag whose prefix view is the whole read. Park sites: _evict and the _keep
+# overflow (each rank writes its own file; pcache.check pins the rank), never the same-ids dedupe. Small states are
+# skipped (TF_GLM_PARK_MIN_TOKENS, default 65536). Close/shutdown wiring deferred by design: no close hook exists in
+# cuda/server.py or cuda/http.py, and the daemon writer dies with the process.
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
+@@ -405,26 +405,32 @@
+     if len(rows) != len(caches) or any(r.shape[1] != idx.numel() for r in rows):
+         raise ValueError("a kept state's DFlash2 window does not match the drafter's ring")
+     for c, r in zip(caches, rows):
+         c.index_copy_(1, idx, r)
+ 
+ 
+-def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
++def _row_views(st, n: int, m: int, *, paged_io: bool = False) -> list[torch.Tensor]:
+     """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values,
+-    and the indexer's pooled keys (its per-token keys and gates live in rings: the snapshot's ``tail``)."""
+-    views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
++    and the indexer's pooled keys (its per-token keys and gates live in rings: the snapshot's ``tail``). With
++    ``paged_io`` the views go to a paged reader (pcache.load_snapshot's live reads); our caches hold no paged
++    extents, so a prefix view is the whole read."""
++
++    def prefix(view, count):
++        return view.section(count) if paged_io and hasattr(view, "section") else view[:count]
++
++    views = [prefix(kc, n) for kc in st.kc] + [prefix(vc, n) for vc in st.vc if vc is not None]
+     idx = st.index or []
+     main_idx = idx[:len(st.kc)]
+     for _, _, pk in main_idx:
+-        views.append(pk[:n // 4 + 1])
++        views.append(prefix(pk, n // 4 + 1))
+     if m > 0 and hasattr(st, "mtp_kc"):
+-        views.append(st.mtp_kc[:m])
++        views.append(prefix(st.mtp_kc, m))
+         if getattr(st, "mtp_vc", None) is not None:
+-            views.append(st.mtp_vc[:m])
++            views.append(prefix(st.mtp_vc, m))
+         if len(idx) > len(st.kc):
+-            views.append(idx[-1][2][:m // 4 + 1])
++            views.append(prefix(idx[-1][2], m // 4 + 1))
+     return views
+ 
+ 
+ def _drafter_views(drafter, n: int) -> list[torch.Tensor]:
+     """DFlash2's context rows a snapshot of n tokens depends on: its sliding window's keys and values before n (every
+     later query sits at n or past it, and masks older rows), per draft layer."""
+@@ -431,16 +437,16 @@
+     lo = max(0, n - drafter.window - 1)
+     return [c[:, lo:n] for c in drafter.kc] + [c[:, lo:n] for c in drafter.vc]
+ 
+ 
+-def _saved_views(e: Engine, snap: Snapshot, drafter=None) -> list[torch.Tensor]:
++def _saved_views(e: Engine, snap: Snapshot, drafter=None, *, paged_io: bool = False) -> list[torch.Tensor]:
+     """The rows ``save_rows`` copies: the attention rows, and with ``drafter`` (whose context the snapshot ends at)
+     DFlash2's window rows."""
+     n = len(snap.ids)
+-    views = _row_views(e.st, n, max(snap.mtp_len, 0))
++    views = _row_views(e.st, n, max(snap.mtp_len, 0), paged_io=paged_io)
+     if drafter is not None and snap.drafter_end == n and not getattr(drafter, "ring", 0):   # a ring's: drafter_rows
+         views += _drafter_views(drafter, n)
+     return views
+ 
+ 
+ def save_rows(e: Engine, snap: Snapshot, drafter=None) -> None:
+     """Copy a snapshot's attention rows out of the live caches before another conversation overwrites them; DFlash2's
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -58,12 +58,13 @@
+ 
+ _NULL = contextlib.nullcontext()                    # TF_GLM_SEGPROF off, or not a profiled round's span
+ 
+ ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL = range(1, 11)
+ CHECKPOINT, RESUME = 11, 12                   # burst-prefix plans, decided only by rank 0
+-OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
+-       IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL", CHECKPOINT: "CHECKPOINT", RESUME: "RESUME"}
++RESTORE = 13                                  # a parked prompt's restore, decided only by rank 0
++OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
++       IDLE: "IDLE", SLOT: "SLOT", MFILL: "MFILL", CHECKPOINT: "CHECKPOINT", RESUME: "RESUME", RESTORE: "RESTORE"}
+ 
+ 
+ def watchdog_seconds(value: str | None = None) -> float:
+     """TF_GLM_MULTI_WATCHDOG_S: seconds a rank-0 iteration (or a rank-1 message it is owed) may take before every
+     thread's Python stack is dumped to the log (faulthandler; 0: off; default 300)."""
+@@ -755,26 +756,40 @@
+         payload = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
+                    int(draft), *pack_sampling(s.sampling), *(shared + [0] * SHARED_SLOTS)[:SHARED_SLOTS], *code,
+                    *pack_prompt(prompt, hit if incremental and (feed is None or cap) else None)]
+         from tensorfold.engine.grammar import pack
+ 
+         packed = pack(s.constraint)
+         payload += [len(packed), *packed, len(positions), *positions]
+         self._emit(ADMIT, payload)
+         try:
+             self._admitted(self._parse_admit(payload), s, feed, s.constraint, info.get("spec", ""))
+         except Exception as exc:              # rank 1 applies the same ADMIT: the ranks may no longer agree
+             self.broken = exc
+             raise
++        # no kept prompt resumed this stream and the disk tier is on: restore the prompt's parked state
++        # (rank 0 only here; rank 1 applies the RESTORE emitted below). A vision feed's rows are never parked.
++        if cut == 0 and draft and s.vision is None and getattr(g, "disk", None) is not None:
++            def fits(entry):
++                n = int(entry["n"])
++                return (n > 0 and (not self.grid or n % self.grid == 0)
++                        and (self.drafts is None or entry.get("drafter") and entry.get("ring"))
++                        and (n < len(prompt) or n == len(prompt) and entry.get("head")))
++            parked = g.disk.lookup(prompt, fits)
++            if parked is not None:
++                n = int(parked["n"])
++                self._emit(RESTORE, [sid, n])
++                self._flush()               # rank 1 must apply ADMIT and RESTORE before this gather: a batched
++                self._restore_parked(sid, n)  # outbox would deadlock it inside the first _share
+ 
+     def _parse_admit(self, p: list[int]) -> dict:
+         (sid, slot, base, size, kid, copy, count, stop_eos, draft) = p[:9]
+         sampling = unpack_sampling(p[9:19])
+         shared = [v for v in p[19:19 + SHARED_SLOTS] if v]
+         i = 19 + SHARED_SLOTS
+         code = p[i:i + 4]
+         i += 4
+         # Decoding the wire format is unconditional, so ranks with different
+         # local switch settings still follow rank 0's authoritative operation.
+         prompt, i = unpack_prompt(p, i, self._kept_by_id, kid)
+         n = p[i]
+         packed = p[i + 1:i + 1 + n]
+@@ -861,8 +876,79 @@
+             lane.head = hit.head.clone()
+         self._touch(hit)
+ 
++    def _restore_parked(self, sid: int, n: int) -> None:
++        """Both ranks: sid's lane resumes from its prompt's parked disk state: the state read into the
++        live caches, the lane left exactly as a kept-prompt admission at n. Each rank reads its own file (the entry
++        key pins the rank); a failed check or read raises — the ranks are then out of step, like any restore."""
++
++        from .decode import put_ring_tail
++        from .engine import grid_point
++        from .pcache import load_snapshot
++
++        started = time.perf_counter()
++        lane, d = self.lanes[sid], getattr(self.g, "disk", None)
++        prompt = lane.s.prompt
++        ids = list(prompt[:n])
++        meta = d.check(ids)
++        prev = self.e.use(lane.st)
++        try:
++            snap = load_snapshot(d, self.e, ids, meta, live=True)
++            if lane.dflash and (snap.drafter_end != n or snap.drafter_rows is None):
++                raise RuntimeError("a parked state without DFlash2's window was chosen for a DFlash2 stream")
++            if lane.st.cur:
++                lane.st.rec[lane.st.cur[0]].copy_(snap.rec)
++            lane.st.conv.copy_(snap.conv)
++            put_ring_tail(lane.st, snap)
++            if self.drafts is not None and lane.dflash:
++                put_draft_window(self._ctx(lane), n, snap.drafter_rows)
++            if n == len(prompt) and snap.head is None:
++                raise RuntimeError(f"the parked state of stream {sid}'s prompt kept no head row")
++        finally:
++            self.e.use(prev)
++        lane.st.set_pos(n)
++        lane.s.cached = n
++        lane.head = snap.head.clone() if n == len(prompt) else None
++        lane.point = grid_point(len(prompt), n, self.grid)
++        lane.shared = [p for p in lane.shared if p > n]
++        lane.stops = [p for p in lane.stops if p > n]
++        snap.kid = self.next_kid
++        self.next_kid += 1
++        snap.extent = lane.extent
++        keep_rendered(snap, prompt)
++        lane.extent.kept.append(snap)
++        self.kept.append(snap)
++        d.touch(d.key(ids))
++        d.stats["hits"] += 1
++        tier = getattr(d, "last_read_tier", "") or "nvme"
++        lane.s.glm_lane = dict(getattr(lane.s, "glm_lane", None) or {}, prompt_cache_tier=tier, disk_cached=n,
++                               disk_load_s=round(time.perf_counter() - started, 3))
++        d.log(f"stream {sid}: a parked state of {n} tokens restored ({tier})")
++
++    def _park(self, c) -> None:
++        """Each rank: its own file of the dropped kept prompt's state to the disk tier, before its rows go
++        (Aevonix 261's park; the state's pages are reusable the moment this returns). Small states, image feeds and
++        a missing tier are skipped; a failed park is an ordinary future miss, never an eviction failure."""
++
++        d = getattr(self.g, "disk", None)
++        if d is None or getattr(c, "images", None):
++            return
++        if len(c.ids) < int(os.environ.get("TF_GLM_PARK_MIN_TOKENS", "65536")):
++            d.log(f"a kept prompt of {len(c.ids)} tokens is dropped without parking (TF_GLM_PARK_MIN_TOKENS)")
++            return
++        from types import SimpleNamespace
++
++        from .forward import State
++
++        st = State(self.w, c.extent.size, self.e.rows, caches=self.e.caches, base=c.extent.base,
++                   slots=self.e.slots, slot=0)          # slot 0: only the caches' views at c.extent.base are read
++        try:
++            d.park(SimpleNamespace(st=st), c)           # c is the Snapshot; only e.st's row views come from st
++        except Exception as exc:                        # noqa: BLE001  (a failed park is an ordinary future miss)
++            d.stats["failed"] += 1
++            d.log(f"a kept prompt of {len(c.ids)} tokens did not park ({type(exc).__name__}: {exc})")
++
+     def _can_checkpoint(self, lane: Lane, point: int) -> bool:
+         """A new read must not need drafter taps an earlier chunk may have skipped."""
+         if (not self.grid or lane.decoding or lane.feed is not None or not lane.s.draft
+                 or lane.st.pos % self.grid):
+             return False
+@@ -1054,29 +1140,29 @@
+         snap.drafter_end = -1
+         if lane.dflash:
+             snap.drafter_end = n
+             snap.drafter_rows = draft_window(self._ctx(lane), n)
+         snap.head = head
+         snap.kid = self.next_kid
+         self.next_kid += 1
+         snap.extent = lane.extent
+         keep_rendered(snap, lane.s.prompt)
+         for c in [c for c in self.kept if c.ids == snap.ids]:
+             self._drop(c)
+         lane.extent.kept.append(snap)
+         self.kept.append(snap)
+         while len(self.kept) > max(1, self.g.cache_entries):
+-            self._drop(self.kept[0])
++            self._drop(self.kept[0], park=True)
+ 
+     def _drop(self, c) -> None:
+         """Forget a kept prompt; its extent goes when nothing else holds it, else shrinks to what is kept."""
+ 
+         if self.cache_reasons:
+             self.evicted_prefixes.append((len(c.ids), self._prefix_fingerprint(c.ids)))
+             self.evicted_prefixes = self.evicted_prefixes[-max(1, min(64, self.g.cache_entries)):]
+         self.kept = [k for k in self.kept if k is not c]
+         x = c.extent
+         x.kept = [k for k in x.kept if k is not c]
+         c.rec = c.conv = None
+         c.tail = c.head = None
+         c.drafter_rows = None
+         self._settle(x)
+@@ -1068,12 +1154,14 @@
+             self._drop(self.kept[0])
+ 
+-    def _drop(self, c) -> None:
++    def _drop(self, c, park=False) -> None:
+         """Forget a kept prompt; its extent goes when nothing else holds it, else shrinks to what is kept."""
+ 
+-        if self.cache_reasons:
++        if park:
++            self._park(c)                       # before the rows are given up: the pages may be reused after
++        if self.cache_reasons:
+             self.evicted_prefixes.append((len(c.ids), self._prefix_fingerprint(c.ids)))
+             self.evicted_prefixes = self.evicted_prefixes[-max(1, min(64, self.g.cache_entries)):]
+         self.kept = [k for k in self.kept if k is not c]
+         x = c.extent
+         x.kept = [k for k in x.kept if k is not c]
+         c.rec = c.conv = None
+@@ -1091,15 +1179,15 @@
+         if size < x.size:
+             self.pool.resize(x, size)
+ 
+     def _evict(self, c) -> None:
+         """Rank 0: drop a kept prompt on both ranks."""
+ 
+         self._emit(EVICT, [c.kid])
+-        self._drop(c)
++        self._drop(c, park=True)
+ 
+     # -- room --------------------------------------------------------------------------------------------------------------
+     def _used(self, x) -> int:
+         used = max([len(k.ids) for k in x.kept], default=0)
+         if x.owner is not None:
+             used = max(used, self.lanes[x.owner].st.pos)
+         return used
+@@ -1877,34 +1965,36 @@
+                 s = Stream(list(a["prompt"]), a["count"], a["sampling"], draft=a["draft"], stop_eos=a["stop_eos"],
+                            sid=a["sid"])
+                 constraint = None
+                 if a["packed"]:
+                     from tensorfold.engine import grammar
+ 
+                     constraint = grammar.compiler(self.g, self.g.model_dir, self.g.eos).follow(a["packed"])
+                     s.constraint = constraint
+                 feed = None
+                 if a["positions"]:
+                     from .engine import VisionFeed
+ 
+                     feed = VisionFeed(self.g, list(a["positions"]), None)
+                     s.vision = feed
+                 self._admitted(a, s, feed, constraint)
+             elif op == EVICT:
+-                self._drop(self._kept_by_id(p[0]))
++                self._drop(self._kept_by_id(p[0]), park=True)
++            elif op == RESTORE:
++                self._restore_parked(p[0], p[1])
+             elif op == MOVE:
+                 self._move(self.pool.get(p[0]), p[1], p[2])
+             elif op == GROW:
+                 self._resize(self.pool.get(p[0]), p[1])
+             elif op == FILL:
+                 lane = self.lanes[p[0]]
+                 if p[1] != self._stop_bound(lane, p[1]):
+                     raise RuntimeError(f"rank 1: stream {p[0]}'s prompt chunk to {p[1]} passes a kept point")
+                 first = self._fill(lane, p[1])
+                 if first is not None:
+                     lane.s.take([first], self._ends(lane))
+             elif op == MFILL:
+                 group = []
+                 for sid, stop in zip(p[1:1 + 2 * p[0]:2], p[2:2 + 2 * p[0]:2]):
+                     lane = self.lanes[sid]
+                     if stop != self._stop_bound(lane, stop):
+                         raise RuntimeError(f"rank 1: stream {sid}'s prompt chunk to {stop} passes a kept point")
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -720,6 +720,16 @@
+ 
+         mine += [int(cfg.quant == "exl3" and exl3_route(str(model_dir), rank, world) == "universal"),
+                  shared_qmm.GROUP_MODES.index(shared_qmm.GROUP_MODE)]
++        # the disk tier joins the ranks' agreement — one flag byte, then the launch fingerprint as 8
++        # fixed-width ints ("0" * 64 when a rank has the tier off, so a mismatch is diagnosed here, not by a
++        # collective that disagrees on its shape).
++        from .pcache import launch_digest
++
++        disk_settings = list(mine)              # the identity's settings are what the ranks agreed on
++        multi_disk = int(parallel > 1 and os.environ.get("TF_GLM_MULTI_PARK", "0") == "1"
++                         and os.environ.get("TF_GLM_DISK_CACHE", "").strip() not in ("", "0", "off"))
++        fingerprint = launch_digest() if multi_disk else "0" * 64
++        mine += [multi_disk, *(int(fingerprint[i:i + 8], 16) & 0x7FFFFFFF for i in range(0, 64, 8))]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -734,7 +744,8 @@
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
+                                "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS, TF_GLM_KDA_OVERLAP, TF_GLM_DRAFT_PROMPT_SKIP, "
+-                               "TF_GLM_DRAFT_FAST*, TF_GLM_MULTI_GRAPH_STEP, TF_GLM_EXL3_PATH, TENSORFOLD_QMM_GROUP): "
++                               "TF_GLM_DRAFT_FAST*, TF_GLM_MULTI_GRAPH_STEP, TF_GLM_MULTI_PARK, TF_GLM_DISK_CACHE, "
++                               "TF_GLM_EXL3_PATH, TENSORFOLD_QMM_GROUP): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                                "every rank the same flags")
+@@ -933,11 +944,26 @@
+         # kept conversations (decode.Snapshot, least recently used first) and the live caches' ids; states and saved rows stay within cache_bytes
+         self.cache: list = []
+         self.live: list[int] = []
+         # TF_GLM_CACHE_SHARE_PCT (patch 0932): entries derived from the pool's budget (kept_entries, --parallel) win
+         self.cache_entries = getattr(self, "entries", None) or int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
++        # the disk tier behind the kept prompts (0940's pcache.DiskCache); the multi decoder reads it
++        self.disk = None
++        if parallel > 1 and os.environ.get("TF_GLM_MULTI_PARK", "0") == "1" \
++                and os.environ.get("TF_GLM_DISK_CACHE", "").strip() not in ("", "0", "off"):
++            from .pcache import DiskCache, engine_identity
++
++            settings = [v for i, v in enumerate(disk_settings) if i != 1]   # index 1 is the capacity: free-VRAM dependent
++            identity = engine_identity(model_dir, drafter, settings, kv=kv, world=world, cp=0)
++            self.disk = DiskCache.from_env(identity, rank=rank, world=world, cp=0, kv=kv,
++                                           log=lambda t: print(f"[tensorfold] rank {rank}: {t}", flush=True))
++            if rank == 0:
++                d = self.disk
++                print(f"[tensorfold] kept prompt states also on disk in {d.root} (TF_GLM_DISK_CACHE): up to "
++                      f"{d.budget / 2 ** 30:.1f} GiB, leaving {d.keep_free / 1e9:.0f} GB free; {len(d.entries)} "
++                      f"states there, {d.held() / 2 ** 30:.2f} GiB", flush=True)
+         if parallel > 1:
+             from .multi import GlmScheduler, MultiDecoder
+ 
+             self.multi = MultiDecoder(self, parallel)
+             self.multi.model_dir = self.model_dir
+             if rank == 0:

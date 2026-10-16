@@ -1,0 +1,71 @@
+# 0932 (x16 C): the kept prompt state count can follow a share of the pool's memory, behind
+# TF_GLM_CACHE_SHARE_PCT (default 0: off, the count stays TF_GLM_CACHE_ENTRIES). TF_GLM_CACHE_ENTRIES is a memory
+# reservation as well as a limit: --parallel reserves ENTRIES x ~45 MiB out of what TF_GLM_CACHE_GIB leaves the pool,
+# so 32 entries (~1.4 GiB) can push a pool of millions of free tokens empty at the 33rd conversation. The share makes
+# the count at least that percent of the pool's budget in states; past three quarters of the budget the count is cut
+# (the states would own memory the start-up estimate never counted), logged on rank 0.
+# Source: MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold d6571a2a6f593aa61de53c8b3a1f8319fb22097c
+# (patches/0097-glm-kept-entries-share.patch, Apache-2.0), adapted: our tree has no display reservation
+# (no display_kv.credit()), so the budget is self.cache_bytes; multi.py's known_key() prefix-array cache is skipped
+# (our _ids_array already caches the array with the state).
+# x16-id: C
+# x16-flag: TF_GLM_CACHE_SHARE_PCT
+# x16-source: miaai-lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold d6571a2a6f593aa61de53c8b3a1f8319fb22097c patches/0097-glm-kept-entries-share.patch
+# x16-guard: TF_GLM_CACHE_SHARE_PCT kept_entries entries
+
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -209,6 +209,27 @@
+     return out[-SHARED_MOST:]
+ 
+ 
++def kept_entries(configured: int, share_pct: float, budget: int, state: int) -> tuple[int, str]:
++    """How many kept prompt states ``--parallel`` reserves memory for and keeps: (count, a note for the log, "" when
++    nothing changed). TF_GLM_CACHE_SHARE_PCT (patch 0932, default 0: off) makes the count at least that share of the
++    pool's budget -- a pool-sized count, so a pool of millions of free tokens is not pushed empty by 32 one-shot
++    conversations. Past three quarters of the budget the count is cut: the states would own memory the start-up
++    estimate never counted. Pure arithmetic, the same on every rank."""
++
++    state = max(1, state)
++    n = max(1, configured)
++    note = ""
++    if share_pct > 0:
++        n = max(n, int(budget * min(share_pct, 75.0) / 100 // state))
++        note = f"{n} (at least {share_pct:g}% of the {budget / 2 ** 30:.1f} GiB the pool shares, ~{state >> 20} MiB each)"
++    ceiling = max(1, int(budget * 0.75) // state)
++    if n > ceiling:
++        n = ceiling
++        note = (f"{n}, not the {configured} asked: they would take more than three quarters of the {budget / 2 ** 30:.1f} "
++                f"GiB the pool shares ({state >> 20} MiB each reserved at start)")
++    return n, note
++
++
+ def user_opener(model_dir: Path) -> int | None:
+     """The id of GLM's ``<|user|>`` role token (the first one ends the system block), or None without a tokenizer."""
+ 
+@@ -779,6 +800,15 @@
+             per_token = max(1, -(-(g.bytes_at(capacity + 65536) - g.bytes_at(capacity)) // 65536))
+             states = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8")) * (slot_bytes(text, world, rows=0, rank=rank) // 2 +
+                                                                           (22 << 20))
++            # TF_GLM_CACHE_SHARE_PCT (patch 0932): the kept count follows a share of the pool's budget, the largest
++            # rank's state cost decides; our tree has no display reservation (no display_kv) so the budget is cache_bytes
++            state = max(slot_bytes(text, world, rows=0, rank=r) // 2 + (22 << 20) for r in range(world))
++            self.entries, why = kept_entries(int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8")),
++                                             float(os.environ.get("TF_GLM_CACHE_SHARE_PCT", "0") or 0),
++                                             self.cache_bytes, state)
++            if rank == 0 and why:
++                print(f"[tensorfold] kept prompt states: {why}", flush=True)
++            states = self.entries * (slot_bytes(text, world, rows=0, rank=rank) // 2 + (22 << 20))
+             pool_rows = (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
+             if pool_rows < ALIGN:
+                 raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
+@@ -903,7 +933,8 @@
+         # kept conversations (decode.Snapshot, least recently used first) and the live caches' ids; states and saved rows stay within cache_bytes
+         self.cache: list = []
+         self.live: list[int] = []
+-        self.cache_entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
++        # TF_GLM_CACHE_SHARE_PCT (patch 0932): entries derived from the pool's budget (kept_entries, --parallel) win
++        self.cache_entries = getattr(self, "entries", None) or int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
+         if parallel > 1:
+             from .multi import GlmScheduler, MultiDecoder
+ 

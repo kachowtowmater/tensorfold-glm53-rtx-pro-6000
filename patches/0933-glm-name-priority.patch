@@ -1,0 +1,118 @@
+# 0933 (x16 E): a second served id whose requests default to the background class, behind
+# TENSORFOLD_NAME_PRIORITY (default "": off) and --name-priority (id=class, repeated). The fleet's serve scripts set
+# the env form (e.g. TENSORFOLD_NAME_PRIORITY=glm-5.3-flash-bg=background); cli.py serves the id (start.sh passes it
+# as --alias) and hands {id: class} to App, which defaults a request from such an id to "background" before
+# request_class orders admission (TENSORFOLD_PRIORITY must be on; an explicit priority in the body always wins).
+# Source: ashhart/TensorFold dce62cfa3c6752c828c4a17338d3ae585e43e65a + 07f3777a4d1739534d04beaf9f14b1f6d3024472
+# (src/tensorfold/serve_options.py), ported via Aevonix 0066 (glm-priority-lanes); _name_priority_env() is ours
+# (the upstream reads the flag in the CLI layer only).
+# x16-id: E
+# x16-flag: TENSORFOLD_NAME_PRIORITY
+# x16-source: ashhart/TensorFold dce62cfa3c6752c828c4a17338d3ae585e43e65a src/tensorfold/serve_options.py
+# x16-guard: TENSORFOLD_NAME_PRIORITY name_priority background_ids
+
+--- tensorfold/serve_options.py
++++ tensorfold/serve_options.py
+@@ -4,9 +4,38 @@
+ 
+ import argparse
+ import inspect
++import os
++from pathlib import Path
+ from typing import Any
+ 
+ 
++def name_priority(args: Any) -> dict[str, str]:
++    """--name-priority entries ("id=class", repeated) as {id: class}; ValueError for a malformed one."""
++
++    out: dict[str, str] = {}
++    for entry in getattr(args, "name_priority", None) or ():
++        text = str(entry).strip()
++        ident, sep, klass = text.partition("=")
++        if not sep or not ident.strip() or not klass.strip():
++            raise ValueError(f"--name-priority: model id = priority class (background, for instance), not {text!r}")
++        out[ident.strip()] = klass.strip()
++    return out
++
++
++def _name_priority_env() -> dict[str, str]:
++    """TENSORFOLD_NAME_PRIORITY (patch 0933, default "": off) as {id: class}: comma- or space-separated
++    "id=class" pairs, so the fleet's serve scripts can set a background alias without a code change."""
++
++    raw = os.environ.get("TENSORFOLD_NAME_PRIORITY", "")
++    if not raw.strip():
++        return {}
++
++    class _Args:
++        name_priority = [part for part in raw.replace(",", " ").split() if part]
++
++    return name_priority(_Args())
++
++
+ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any = None) -> None:
+     """Refuse KV cache, draft rule, image, share, slot and precision options the backend or family can't serve."""
+ 
+--- tensorfold/cli_args.py
++++ tensorfold/cli_args.py
+@@ -28,6 +28,9 @@
+     endpoint.add_argument("--port", type=int, default=8080)
+     endpoint.add_argument("--name", default="", help="model id clients ask for (default: the model's name)")
+     endpoint.add_argument("--alias", action="append", default=[], help="another model id to answer to")
++    endpoint.add_argument("--name-priority", action="append", default=[],
++                          help="serve another model id whose requests default to a priority class (id=class, repeat for "
++                               "more; TENSORFOLD_NAME_PRIORITY is the env form)")
+     endpoint.add_argument("--api-key", action="append", default=[], help="require this API key; repeat for more keys")
+     endpoint.add_argument("--api-key-file", help="restricted key file, one key or label: key per line; # comments")
+     endpoint.add_argument("--metrics-open", action="store_true", help="allow metrics without an API key")
+--- tensorfold/cli.py
++++ tensorfold/cli.py
+@@ -16,7 +16,8 @@
+ from tensorfold import cli_args
+ from tensorfold.server import stacks, thinking_notes
+ from tensorfold.server.memory_budget import MEMORY_FRACTION
+-from tensorfold.serve_options import check as _check_serve_options, vision_options as _vision_options
++from tensorfold.serve_options import check as _check_serve_options, name_priority as _name_priority, \
++    _name_priority_env, vision_options as _vision_options
+ 
+ COMMANDS = ("serve", "pull", "models", "info", "update", "service", "tui", "plan")
+ 
+@@ -309,7 +310,8 @@
+                     vision_max_images=getattr(args, "vision_max_images", None),
+                     **({"vision_image_tokens": args.vision_image_tokens}
+                        if getattr(args, "vision_image_tokens", None) is not None else {}),
+-                    aliases=list(args.alias))
++                    aliases=list(args.alias),
++                    background_ids=frozenset({**_name_priority_env(), **_name_priority(args)}))
+     shown = "greedy" if float(sampling.get("temperature", 1.0)) <= 0 else ", ".join(
+         f"{k} {v}" for k, v in sampling.items())
+     effective_context = app.effective_context_window
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -78,7 +78,8 @@
+                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
+                  context_window: int | None = None, reasoning_effort: str | None = None, thinking_budget: int = 0,
+                  aliases: tuple[str, ...] | list[str] = (), vision_max_images: int | None = None,
+-                 vision_image_tokens: int | None = None):
++                 vision_image_tokens: int | None = None,
++                 background_ids: frozenset[str] | set[str] = frozenset()):
+         from tokenizers import Tokenizer
+ 
+         self.engine = engine
+@@ -88,6 +89,7 @@
+                         **({} if vision_image_tokens is None else {"max_visual_tokens": vision_image_tokens}))
+         self.served = served
+         self.aliases = tuple(str(alias).strip() for alias in aliases if str(alias).strip())
++        self.background_ids = frozenset(background_ids)   # --name-priority: ids whose requests default to background
+         self.model_dir = Path(model_dir)
+         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
+         from tensorfold.cuda.fasttok import load as fast_load
+@@ -561,6 +563,9 @@
+             # engine's scheduler, which orders admission, prompt chunks and rounds by it (``tensorfold.cuda.priority``)
+             from tensorfold.cuda import priority as prio
+ 
++            # TENSORFOLD_NAME_PRIORITY / --name-priority (patch 0933): an id in background_ids defaults to background
++            if "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ()) and prio.enabled():
++                body.setdefault("priority", "background")
+             klass = prio.request_class(body, title=title)
+             background = klass >= prio.BACKGROUND
+             options["priority"] = klass

@@ -1,0 +1,565 @@
+# 0990 (round 2, design notes D2): write-behind park.
+# With TF_GLM_PARK_ASYNC=1, DiskCache.park no longer drains the writer or writes inline, and no longer builds,
+# checksums or allocates the file image on the request thread (round 1 froze decode on GPU: per-park whole-image
+# host allocation + per-piece checksums there). A staging pool of TF_GLM_PARK_STAGING_GIB (8 GiB a rank) is
+# preallocated pinned host memory in DiskCache.__init__; park reserves one extent of the file's size from it
+# (first-fit, pure bookkeeping), copies the sections in (D2H synced before park returns), publishes the extent to
+# the RAM tier under the pending key, adds the index entry at once, and hands the Writer the job. The Writer
+# computes the per-piece checksums and writes the header into the extent, sets the ready event (BEFORE any disk
+# I/O: check()/read() serve the complete RAM image while the NVMe write is still running), then pwrites the
+# extent, fsyncs, renames, re-keys a private RAM-tier copy to the file's HostTier key, and releases the extent
+# back to the pool on success and failure alike. A full pool (or a full queue) drops the park at once:
+# stats["skipped"], a log line, nothing indexed. Unset or 0 keeps today's synchronous park exactly.
+# x25-id: 0990
+# x25-flag: TF_GLM_PARK_ASYNC
+--- tensorfold/families/glm5_next/cuda/pcache.py
++++ tensorfold/families/glm5_next/cuda/pcache.py
+@@ -129,6 +129,9 @@ class HostBuffer:
+     def view(self, a: int, b: int) -> memoryview:
+         return memoryview(self.map)[a:b]
+ 
++    def __len__(self) -> int:
++        return self.nbytes
++
+     def close(self) -> None:
+         if self.map is None:
+             return
+@@ -256,18 +259,165 @@ class Job:
+     def __init__(self, key: str, path: Path, meta: dict, tensors: list[tuple[str, torch.Tensor]], entry: dict) -> None:
+         self.key, self.path, self.meta, self.tensors, self.entry = key, path, meta, tensors, entry
+         self.n = int(meta["n"])
++        self.image = None                                   # an async park's staging extent (no live tensors)
+         self.ready = None
+         if any(t.is_cuda for _, t in tensors):
+             self.ready = torch.cuda.Event()
+             self.ready.record()
+         self.cancel = False
+         self.bytes = 0
++        self.done = None                                    # r3: the D2H copies' done event (async park)
+ 
+ 
+ class Cancelled(Exception):
+     pass
+ 
+ 
++class _Extent:
++    """One reservation of the park staging pool: ``.map`` is the reserved slice of the pool's memory as
++    a writable uint8 numpy view (a view of ``HostBuffer.array``: whatever that supports, this supports), ``tensor``
++    the same bytes as a flat uint8 tensor over the pinned HostBuffer (a D2H ``copy_`` lands in the extent),
++    ``off``/``nbytes`` identify it for the pool. One owner at a time (round 3): ``released`` flips on
++    ``_ParkPool.release`` and a second release raises instead of corrupting the free list."""
++
++    __slots__ = ("map", "nbytes", "off", "tensor", "released")
++
++    def __init__(self, pool_arr: np.ndarray, off: int, nbytes: int) -> None:
++        self.map, self.nbytes, self.off = pool_arr[off:off + nbytes], nbytes, off
++        self.tensor = torch.from_numpy(pool_arr[off:off + nbytes])
++        self.released = False
++
++    def __len__(self) -> int:
++        return self.nbytes
++
++
++class _ParkPool:
++    """One preallocated pinned staging buffer (TF_GLM_PARK_STAGING_GIB per rank) and a first-fit extent
++    allocator over it: park reserves one extent of the file's size, copies the sections into it (no new host
++    allocation on the caller), the Writer checksums, headers and writes it out, then the extent goes back to the
++    free list. Full pool: park drops the state at once (back-pressure)."""
++
++    def __init__(self, nbytes: int, pin: bool) -> None:
++        self.hb = HostBuffer(max(int(nbytes), PAGE), pin)
++        self.free = [(0, self.hb.nbytes)]
++
++    def reserve(self, n: int) -> _Extent | None:
++        """First fit over the free list (coalesced on release): pure bookkeeping, no allocation."""
++
++        n = round_up(n)
++        for i, (off, size) in enumerate(self.free):
++            if size >= n:
++                self.free[i] = (off + n, size - n) if size - n else None
++                if self.free[i] is None:
++                    del self.free[i]
++                return _Extent(self.hb.array, off, n)
++        return None
++
++    def release(self, ext: "_Extent") -> None:
++        """Return an owned extent to the free list, coalescing with the neighbours. One owner at a time (round 3):
++        a second release raises ``ValueError`` instead of handing the same bytes out twice."""
++
++        if ext.released:
++            raise ValueError("a park staging extent was released twice")
++        ext.released = True
++        merged: list[tuple[int, int]] = []
++        for o, s in sorted(self.free + [(ext.off, ext.nbytes)]):
++            if merged and o <= merged[-1][0] + merged[-1][1]:
++                merged[-1] = (merged[-1][0], max(merged[-1][1], o + s - merged[-1][0]))
++            else:
++                merged.append((o, s))
++        self.free = merged
++
++    def close(self) -> None:
++        self.hb.close()
++
++
++def _check_image(image, expect: dict) -> dict:
++    """A pending image's header, validated the way ``read_header`` does (from host memory, no disk read):
++    magic, version, the JSON's checksum, the sections inside the image, ``check_header``."""
++
++    buf = memoryview(image.map)
++    if len(buf) < PAGE or len(buf) % PAGE:
++        raise PCacheError(f"truncated ({len(buf)} bytes)")
++    magic, version, jlen, start, jsum = PREFIX.unpack(bytes(buf[:PREFIX.size]))
++    if magic != MAGIC:
++        raise PCacheError("not a prompt state file")
++    if version != VERSION:
++        raise PCacheError(f"format version {version}, not {VERSION}")
++    if start % PAGE or start < PREFIX.size + jlen or start > len(buf):
++        raise PCacheError("a bad header length")
++    raw = bytes(buf[PREFIX.size:PREFIX.size + jlen])
++    try:
++        algo = json.loads(raw).get("sum", SUM)
++    except ValueError:
++        raise PCacheError("a corrupt header") from None
++    if checksum(raw, algo) != jsum:
++        raise PCacheError("a corrupt header")
++    meta = dict(json.loads(raw), data_start=start, file_bytes=len(buf))
++    end = 0
++    for s in meta.get("sections", []):
++        if s["offset"] % PAGE or s["nbytes"] < 0:
++            raise PCacheError("a misplaced section")
++        end = max(end, s["offset"] + round_up(s["nbytes"]))
++    if start + end > len(buf):
++        raise PCacheError(f"truncated ({len(buf)} bytes, the header asks {start + end})")
++    check_header(meta, expect)
++    return meta
++
++
++def _read_image(image, meta: dict, dests: dict[str, torch.Tensor], *, staging: Staging,
++                pool: ThreadPoolExecutor | None) -> None:
++    """A pending image's sections into ``dests``: the same piece loop as ``_read_sections``, the
++    checksums checked from host memory; no disk read, no file stamp."""
++
++    start, algo = meta["data_start"], meta.get("sum", SUM)
++    secs = meta["sections"]
++    buf = memoryview(image.map)
++    for s in secs:
++        t = dests.get(s["name"])
++        if t is None:
++            raise PCacheError(f"no destination for section {s['name']}")
++        if str(t.dtype).replace("torch.", "") != s["dtype"] or list(t.shape) != list(s["shape"]) or \
++                _nbytes(t) != s["nbytes"]:
++            raise PCacheError(f"section {s['name']}: {s['dtype']} {s['shape']}, the engine's {t.dtype} "
++                              f"{list(t.shape)}")
++    whole = {name: torch.empty_like(t, memory_format=torch.contiguous_format)
++             for name, t in dests.items() if not t.is_contiguous()}
++    pieces = [(s, whole.get(s["name"], dests[s["name"]]), a, min(a + PIECE, s["nbytes"])) for s in secs
++              for a in range(0, s["nbytes"], PIECE)]
++    for w0 in range(0, len(pieces), staging.slots):
++        wave = pieces[w0:w0 + staging.slots]
++
++        def get(item, buf=buf, start=start):
++            i, (s, t, a, b) = item
++            lo, _ = staging.slot(i)
++            mv = staging.buf.view(lo, lo + round_up(b - a))
++            try:
++                offset = start + s["offset"] + a
++                mv[:] = buf[offset:offset + len(mv)]
++                if "%016x" % checksum(mv[:b - a], algo) != s["sums"][a // PIECE]:
++                    raise PCacheError(f"section {s['name']}: checksum mismatch at {a}")
++            finally:
++                mv.release()
++
++        if pool is not None and len(wave) > 1:
++            list(pool.map(get, enumerate(wave)))
++        else:
++            for item in enumerate(wave):
++                get(item)
++        cuda = False
++        for i, (s, t, a, b) in enumerate(wave):
++            cuda = cuda or t.is_cuda
++            if hasattr(t, "write_bytes"):
++                t.write_bytes(a, staging.tensor(i, b - a))
++            else:
++                _u8(t)[a:b].copy_(staging.tensor(i, b - a), non_blocking=t.is_cuda)
++        if cuda:
++            torch.cuda.current_stream().synchronize()          # the staging slots are reused by the next wave
++    for name, t in whole.items():
++        dests[name].copy_(t)
++
++
+ def write_file(path: Path, meta: dict, tensors: list[tuple[str, torch.Tensor]], *, staging: Staging,
+                pool: ThreadPoolExecutor | None, direct: bool = True, job: Job | None = None,
+                stream=None) -> int:
+@@ -436,11 +586,16 @@ def check_header(meta: dict, expect: dict) -> None:
+ 
+ 
+ def read_sections(path: Path, meta: dict, dests: dict[str, torch.Tensor], *, staging: Staging,
+-                  pool: ThreadPoolExecutor | None, direct: bool = True, host_tier=None) -> None:
++                  pool: ThreadPoolExecutor | None, direct: bool = True, host_tier=None,
++                  pending_image=None) -> str:
+     """Every section of a validated header into ``dests[name]`` (contiguous tensors of its dtype and shape, on any
+     device; the live caches' rows included), piece by piece through the staging ring, each piece checksummed before
+-    it is copied out. Raises PCacheError (a destination may then hold part of the file)."""
++    it is copied out. Raises PCacheError (a destination may then hold part of the file). A ``pending_image``
++    (a write-behind park's RAM copy) serves the sections from host memory instead of the file: "ram"."""
+ 
++    if pending_image is not None:
++        _read_image(pending_image, meta, dests, staging=staging, pool=pool)
++        return "ram"
+     tier = host_tier if host_tier is not None and host_tier.budget else None
+     try:
+         key = tier.key(path) if tier is not None else None
+@@ -636,6 +791,12 @@ def _env_float(name: str, default: float) -> float:
+     return float(v) if v else float(default)
+ 
+ 
++def _park_async() -> bool:
++    """TF_GLM_PARK_ASYNC=1: park builds the file image in host memory (the RAM tier serves it at once) and hands
++    the NVMe write to the background Writer; unset or 0 keeps the synchronous park."""
++    return os.environ.get("TF_GLM_PARK_ASYNC", "").strip() == "1"
++
++
+ class DiskCache:
+     """Kept prompt states in ``root`` for one engine identity and rank: an LRU index of this rank's files, the
+     background writer, the readers. Every method but the writer's runs on the request thread."""
+@@ -655,6 +816,10 @@ class DiskCache:
+         self.index_path = self.root / f"index.{self.tag}.json"
+         self.lock = threading.RLock()
+         self.entries: dict[str, dict] = {}
++        self.pending: dict[str, tuple[str, "_Extent"]] = {}  # key -> (pending tier key, staging extent)
++        self.pending_evt: dict[str, threading.Event] = {}    # key -> set once the Writer wrote the header
++        self.park_pool = _ParkPool(int(_env_float("TF_GLM_PARK_STAGING_GIB", 8) * 2 ** 30),
++                                   torch.cuda.is_available()) if _park_async() else None
+         self.tick = 0
+         self.stats = {"written": 0, "skipped": 0, "cancelled": 0, "failed": 0, "fenced": 0, "evicted": 0,
+                       "hits": 0, "misses": 0}
+@@ -740,7 +905,7 @@ class DiskCache:
+                 name = p.name
+                 if mine + "." in name and name.endswith(".part"):
+                     p.unlink(missing_ok=True)
+-            gone = [k for k in self.entries if not self.path(k).exists()]
++            gone = [k for k in self.entries if k not in self.pending and not self.path(k).exists()]
+             for k in gone:
+                 del self.entries[k]
+             known = {self.path(k).name for k in self.entries}
+@@ -767,6 +932,14 @@ class DiskCache:
+     def remove(self, key: str) -> None:
+         with self.lock:
+             self.entries.pop(key, None)
++            pend = self.pending.pop(key, None)                  # a failed restore drops the RAM copy too
++            evt = self.pending_evt.pop(key, None)
++            if evt is not None:
++                evt.set()
++            if pend is not None:
++                self.host_tier.discard(pend[0])
++                # round 3: the extent itself stays with the Writer (the only releaser); it goes back when the job
++                # finishes and its finished write re-indexes nothing (the entry is gone).
+             self.path(key).unlink(missing_ok=True)
+             self._save_index()
+ 
+@@ -841,11 +1014,18 @@ class DiskCache:
+         Multi-session only: the scheduler owns the pages throughout this call.
+         No collective or whole-state clone; the existing bounded staging ring
+         gathers pieces on the writer stream. Failures remain ordinary misses.
++        With TF_GLM_PARK_ASYNC=1: no drain and no inline write -- the sections are copied into a
++        preallocated staging extent (no new host allocation, no checksum on this thread), published to the RAM tier
++        under a pending key, the index entry added at once, and the NVMe write handed to the background Writer,
++        which checksums, heads and writes the extent. A full staging pool drops the park at once.
+         """
+         key = self.key(snap.ids)
+         if self.contains(key):
+             self.touch(key)
+             return
++        if _park_async():
++            self._park_async_write(e, snap, key)
++            return
+         self.writer.drain()
+         fields, tensors = snapshot_sections(e, snap)
+         digest = ids_digest(snap.ids)
+@@ -855,7 +1035,84 @@ class DiskCache:
+                      drafter=fields["drafter_end"] == len(snap.ids), ring=fields["drafter_ring"], head=fields["head"])
+         self._write(Job(key, self.path(key), meta, tensors, entry))
+ 
++    def _park_async_write(self, e, snap, key: str) -> None:
++        """The write-behind park (TF_GLM_PARK_ASYNC=1): the sections copied into a preallocated staging
++        extent (no new host allocation, no checksum, no header, no fsync on this thread -- the Writer does those; the
++        D2H copies are stream-ordered: the copy stream waits on the producer, the caller's stream waits on the copies'
++        done event), the extent published to the RAM tier under the pending key, the index entry added, the file
++        write handed to the Writer. A full pool or a full queue drops the state at once: an ordinary future miss."""
++
++        fields, tensors = snapshot_sections(e, snap)
++        digest = ids_digest(snap.ids)
++        meta = dict(fields, identity=self.identity, rank=self.rank, world=self.world, cp=self.cp, kv=self.kv,
++                    ids_sha256=digest, created=time.time())
++        entry = dict(n=len(snap.ids), ids=digest, identity=self.identity, mtp=False,
++                     drafter=fields["drafter_end"] == len(snap.ids), ring=fields["drafter_ring"], head=fields["head"])
++        secs, data = _layout(tensors)
++        head = _header_bytes(dict(meta, sections=secs, sum=SUM, version=VERSION))
++        start = round_up(PREFIX.size + len(head))
++        need = start + round_up(data)
++        ext = self.park_pool.reserve(need) if self.park_pool is not None else None
++        if ext is None:                                     # DROP (back-pressure): return at once, nothing indexed
++            self.stats["skipped"] += 1
++            self.log(f"park dropped: the staging pool has no free extent for a {need / 2 ** 30:.2f} GiB prompt "
++                     f"state (TF_GLM_PARK_STAGING_GIB)")
++            return
++        total = ext.nbytes
++        cuda = any(t.is_cuda for _, t in tensors)
++        if cuda:                                            # stream-ordered D2H (round 3): the copy stream waits on
++            copy_stream = torch.cuda.Stream()               # the producer, the caller's stream waits on the copies'
++            copy_stream.wait_stream(torch.cuda.current_stream())  # done event -- no CPU sync anywhere on this thread
++            with torch.cuda.stream(copy_stream):
++                for s, (_, t) in zip(secs, tensors):
++                    dst = ext.tensor[start + s["offset"]:start + s["offset"] + s["nbytes"]]
++                    if t.is_cuda:
++                        dst.copy_(_u8(t), non_blocking=True)  # straight into the pinned extent: no ring, no numpy
++                    else:
++                        dst.copy_(_u8(t), non_blocking=False)
++            done = torch.cuda.Event()
++            done.record(copy_stream)
++            torch.cuda.current_stream().wait_event(done)
++        else:
++            for s, (_, t) in zip(secs, tensors):
++                dst = ext.tensor[start + s["offset"]:start + s["offset"] + s["nbytes"]]
++                dst.copy_(_u8(t), non_blocking=False)
++        job = Job(key, self.path(key), dict(meta, sections=secs, sum=SUM, version=VERSION), [], entry)
++        job.image = ext
++        job.bytes = total
++        job.done = done if cuda else None
++        job.ready_evt = threading.Event()                   # set by the Writer once the header (sums) is in the extent
++        pkey = (str(job.path) + ".pending", 0, 0, total, 0, 0)
++        with self.lock:
++            self.tick += 1
++            self.entries[key] = dict(entry, bytes=total, used=self.tick, pending=True)
++            self._save_index(sync=False)                    # no fsync here (round 3): the index is durable on the Writer
++            self.pending[key] = (pkey, ext)
++            self.pending_evt[key] = job.ready_evt
++            self.host_tier.publish(pkey, ext.map)           # the extent's bytes: len()-able, the header lands before the file does
++        if not self.writer.submit(job):
++            self._park_rollback(key, pkey, "the writer's queue is full")
++
++    def _park_rollback(self, key: str, pkey, why: str) -> None:
++        """A submit that did not take (the queue is full): the state stays an ordinary miss. The Writer never got the
++        job, so this -- not the Writer -- is the one place a rollback releases the extent."""
++
++        with self.lock:
++            if self.entries.get(key, {}).get("pending"):
++                del self.entries[key]
++                self._save_index(sync=False)
++            pend = self.pending.pop(key, None)
++            self.pending_evt.pop(key, None)
++        if pend is not None and self.park_pool is not None:
++            self.park_pool.release(pend[1])
++        self.host_tier.discard(pkey)
++        self.stats["skipped"] += 1
++        self.log(f"a parked state's write was not queued ({why}); the state is an ordinary miss")
++
+     def _write(self, job: Job) -> None:
++        if job.image is not None:                           # a write-behind park's built image
++            self._write_image(job)
++            return
+         secs, data = _layout(job.tensors)
+         need = round_up(PREFIX.size + len(_header_bytes(dict(job.meta, sections=secs, sum=SUM, version=VERSION)))) \
+             + round_up(data)
+@@ -873,6 +1130,99 @@ class DiskCache:
+             self._save_index()
+         self.stats["written"] += 1
+ 
++    def _write_image(self, job: Job) -> None:
++        """The background half of a write-behind park: the D2H copies' done event synced first (the
++        extent's bytes are the producer's), then the staging extent's checksums and header land in host memory (the
++        ready event set BEFORE the disk write: a reader serves the image from RAM while the file is still being
++        written), then ``.part`` (one piece a write), fsync, rename; then the budget check and the durable index --
++        round 3: the Writer's jobs, not the request thread's -- and the RAM tier's entry is re-keyed to the file's
++        HostTier key. The extent goes back to the pool here, once, success or failure alike: the Writer is the only
++        releaser (remove() mid-write leaves it to this finally). The image's bytes are exactly what ``write_file``
++        would have written (same layout, same checksums)."""
++
++        from .host_tier import HostTier
++
++        ext, total = job.image, job.bytes
++        ok = False
++        try:
++            if job.done is not None:
++                job.done.synchronize()                      # the D2H copies land before the extent is read (r3)
++            buf = memoryview(ext.map)
++            start = round_up(PREFIX.size + len(_header_bytes(job.meta)))
++            for s in job.meta["sections"]:                  # the Writer checksums: not on the caller's thread (W7/W8)
++                for a in range(0, s["nbytes"], PIECE):
++                    b = min(a + PIECE, s["nbytes"])
++                    s["sums"][a // PIECE] = "%016x" % checksum(buf[start + s["offset"] + a:start + s["offset"] + b])
++            head = _header_bytes(job.meta)
++            start = round_up(PREFIX.size + len(head))
++            PREFIX.pack_into(buf, 0, MAGIC, VERSION, len(head), start, checksum(head))
++            buf[PREFIX.size:PREFIX.size + len(head)] = np.frombuffer(head, dtype=np.uint8)
++            job.ready_evt.set()                             # the RAM image is complete; the disk write follows
++            if not self._room(total):
++                self.stats["skipped"] += 1
++                self.log(f"a {total / 2 ** 30:.2f} GiB prompt state is not written: the budget "
++                         f"({self.budget / 2 ** 30:.1f} GiB) or the free-space floor ({self.keep_free / 1e9:.0f} GB) "
++                         "leaves no room")
++                return
++            tmp = job.path.with_name(job.path.name + f".{os.getpid()}.{threading.get_ident()}.part")
++            fd, is_direct = _open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, self.direct)
++            try:
++                try:
++                    os.posix_fallocate(fd, 0, total)
++                except (OSError, AttributeError):
++                    os.ftruncate(fd, total)
++                for a in range(0, total, PIECE):
++                    if job.cancel:
++                        raise Cancelled()
++                    b = min(a + PIECE, total)
++                    _pwrite(fd, buf[a:b], a)
++                os.fsync(fd)
++                ok = True
++            finally:
++                os.close(fd)
++                if not ok:
++                    try:
++                        os.unlink(tmp)
++                    except OSError:
++                        pass
++            os.replace(tmp, job.path)
++            _fsync_dir(job.path.parent)
++            with self.lock:
++                if not self.entries.get(job.key, {}).get("pending"):
++                    # remove() dropped the state mid-write (r3): the rename must not resurrect it --
++                    # the file goes the way the index went (the Writer is the only thread past this point).
++                    job.path.unlink(missing_ok=True)
++                    _fsync_dir(job.path.parent)
++                    return
++                self.tick += 1
++                self.entries[job.key] = dict(job.entry, bytes=total, used=self.tick)
++                self._save_index()
++            self.stats["written"] += 1
++        finally:
++            with self.lock:
++                pend = self.pending.pop(job.key, None)
++                evt = self.pending_evt.pop(job.key, None)
++            if evt is not None:
++                evt.set()                                   # a waiter must not hang on a failed write either
++            if pend is not None:
++                self.host_tier.discard(pend[0])             # the RAM copy's pending key goes
++                if ok:
++                    # the write landed: the RAM copy lives on under the file's own tier key (a fresh private copy)
++                    with self.lock:
++                        alive = self.entries.get(job.key, {}).get("pending") is False
++                    if alive:                               # remove() mid-write: nothing re-keyed (r3)
++                        tier_arr = self.host_tier.allocate(total)
++                        if tier_arr is not None:
++                            np.copyto(np.frombuffer(tier_arr, dtype=np.uint8), ext.map)
++                            self.host_tier.publish(HostTier.key(job.path), tier_arr)
++                else:
++                    with self.lock:
++                        if self.entries.get(job.key, {}).get("pending"):
++                            del self.entries[job.key]       # the write failed: the state is an ordinary miss
++                            self._save_index()
++            if self.park_pool is not None:
++                self.park_pool.release(ext)                 # success or failure: the Writer releases it, once
++
+     def fence(self, cut: int, prompt: Sequence[int] | None = None) -> int:
+         """The live caches are about to change from position ``cut`` on: queued or running writes of states longer
+         than that are given up (``fence_s`` lets a running one finish first)."""
+@@ -881,23 +1231,63 @@ class DiskCache:
+ 
+     # -- reading
+     def check(self, ids: Sequence[int]) -> dict:
+-        """This rank's file of the state of ``ids``: its validated header (or PCacheError)."""
++        """This rank's file of the state of ``ids``: its validated header (or PCacheError). A state whose write is
++        still pending is validated from its RAM image once the Writer has checksummed and headed it
++        (bounded by ``wait_s``); no wait for the disk."""
+ 
+         key = self.key(ids)
++        with self.lock:
++            pend = self.pending.get(key)
++            evt = self.pending_evt.get(key)
++        if pend is not None:
++            if evt is not None and not evt.wait(self.wait_s):   # the Writer's checksums + header, before the file
++                raise PCacheError("the pending image was never completed")
++            return _check_image(pend[1], self.expect(ids))
+         if not self.writer.wait_key(key, self.wait_s):      # rank 0 may have finished the same state's write first
+             raise PCacheError("still being written")
+         meta = read_header(self.path(key), self.direct)
+         check_header(meta, self.expect(ids))
+         return meta
+ 
++    def check_agreed(self, ids: Sequence[int], gather: Callable[[int], list]) -> dict | None:
++        """The state of ``ids`` restored only when every rank holds it (r3): this rank's flag is the local
++        check (a PCacheError is a plain 0), ``gather(flag)`` is the ranks' all-gather of that one int, and the meta
++        returns only when every rank's flag is 1. On a disagreement this rank drops its copy -- the index entry, the
++        file, the pending RAM copy -- counts a miss and returns None: no rank restores a state another rank lacks."""
++
++        try:
++            meta = self.check(ids)
++            flag = 1
++        except PCacheError:
++            meta, flag = None, 0
++        flags = gather(flag)
++        if not all(int(f) == 1 for f in flags):
++            self.remove(self.key(ids))
++            self.stats["misses"] += 1
++            return None
++        return meta
++
+     def read(self, ids: Sequence[int], meta: dict, dests: dict[str, torch.Tensor]) -> None:
+-        self.last_read_tier = read_sections(self.path(self.key(ids)), meta, dests,
+-                                            staging=self.read_staging, pool=self.read_pool,
+-                                            direct=self.direct, host_tier=self.host_tier)
++        with self.lock:
++            pend = self.pending.get(self.key(ids))
++        if pend is not None:                                # the write is still pending: from the RAM copy
++            self.last_read_tier = read_sections(self.path(self.key(ids)), meta, dests,
++                                                staging=self.read_staging, pool=self.read_pool,
++                                                direct=self.direct, host_tier=self.host_tier,
++                                                pending_image=pend[1])
++        else:
++            self.last_read_tier = read_sections(self.path(self.key(ids)), meta, dests,
++                                                staging=self.read_staging, pool=self.read_pool,
++                                                direct=self.direct, host_tier=self.host_tier)
+         self.log(f"prompt host tier: {self.host_tier.stats()}")
+ 
+     def close(self) -> None:
+         self.writer.drain()
++        with self.lock:                                     # a drained writer re-keyed every image
++            self.pending.clear()
++            self.pending_evt.clear()
++        if self.park_pool is not None:                      # the staging pool goes with the cache
++            self.park_pool.close()
+         self.read_pool.shutdown()
+         self.write_pool.shutdown()
+         self.host_tier.close()
+--- tensorfold/families/glm5_next/cuda/multi.py
++++ tensorfold/families/glm5_next/cuda/multi.py
+@@ -879,7 +879,10 @@ class MultiDecoder:
+     def _restore_parked(self, sid: int, n: int) -> None:
+         """Both ranks: sid's lane resumes from its prompt's parked disk state: the state read into the
+         live caches, the lane left exactly as a kept-prompt admission at n. Each rank reads its own file (the entry
+-        key pins the rank); a failed check or read raises — the ranks are then out of step, like any restore."""
++        key pins the rank); a failed check or read raises — the ranks are then out of step, like any restore. The
++        restore goes ahead only when every rank of the group holds the state (r3): a min all-reduce of
++        one flag over the TP group via ``check_agreed``; on a disagreement every rank drops its copy and leaves the
++        lane fresh -- the prompt is cold-prefilled, exactly as if no state had been parked."""
+ 
+         from .decode import put_ring_tail
+         from .engine import grid_point
+@@ -889,7 +892,18 @@ class MultiDecoder:
+         lane, d = self.lanes[sid], getattr(self.g, "disk", None)
+         prompt = lane.s.prompt
+         ids = list(prompt[:n])
+-        meta = d.check(ids)
++        world = max(1, int(self.g.world))
++
++        def gather(flag: int) -> list[int]:
++            """The ranks' min all-reduce of the check flag (an all-gather reads the same: every rank learns every
++            rank's flag; both ranks reach this collective, so it cannot deadlock)."""
++
++            return [min(row[0] for row in self.g._gather_ints([int(flag)])) for _ in range(world)]
++
++        meta = d.check_agreed(ids, gather)
++        if meta is None:                                    # a rank lacks the state: nobody restores; cold prefill
++            d.log(f"stream {sid}: the parked state of {n} tokens is not on every rank; the prompt prefills cold")
++            return
+         prev = self.e.use(lane.st)
+         try:
+             snap = load_snapshot(d, self.e, ids, meta, live=True)

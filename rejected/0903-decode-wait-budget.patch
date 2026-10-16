@@ -1,5 +1,5 @@
 0903-decode-wait-budget.patch: TensorFold v0.6.5 port.
-Origin: this recipe's first in-house scheduling patch (tb default #1197).
+Origin: this recipe's first in-house scheduling patch.
 Port: written against TF v0.6.5 + the 86-patch release series + 0900 + 0901 (the x2 tree);
 single file: families/glm5_next/cuda/multi.py. See p1-design.md for the map.
 --- tensorfold/families/glm5_next/cuda/multi.py

@@ -17,3 +17,24 @@ export TF_GLM_HC_SPLIT_MIN_ROWS="${TF_GLM_HC_SPLIT_MIN_ROWS:-2048}"
 export TF_GLM_VISION_PREFIX="${TF_GLM_VISION_PREFIX:-1}"
 # 2026-10-13 x14: patches 0921 (tokenize without the GIL) + 0923 (fastokens 0.3.2; IMAGE_EXTRAS needs fastokens==0.3.2). 0 = x9 + 0921.
 export TF_W1_FASTOKENS="${TF_W1_FASTOKENS:-1}"
+# x15 (2026-10-14): prefill fairness = the 0900 time-credit arbiter. Decode keeps >= 0.5 of wall time while a prompt
+# fills (x14 gave it ~0.15, counted by iterations). Paired A/B: other requests' decode during a 32K/128K/400K
+# prefill 6.6x/15x/13x faster; the long prompt's own fill 1.8-2.2x slower.
+export TF_GLM_FILL_CREDIT="${TF_GLM_FILL_CREDIT:-time}" TF_GLM_FILL_SHARE="${TF_GLM_FILL_SHARE:-0.5}"
+# x17 (patch 0933): route a heavy client's id to the background class (--name-priority "id=class"). Foreground TTFT
+# behind that loop: median 86 -> 46 ms, max 177 -> 53 ms (foreground decode -5%). Unset = every id normal class.
+export TENSORFOLD_NAME_PRIORITY="${TENSORFOLD_NAME_PRIORITY:-}"
+# x18 (patches 0940 + 0941): prompt-cache tiers — evicted prompts park to host RAM, then NVMe; a returning session
+# restores its parked state instead of prefilling cold. Evicted-session restore: 400K 45 s -> 2.6 s, 1M 142 s -> 9.2 s,
+# identical text, survives a restart. Budgets are per rank.
+export TF_GLM_MULTI_PARK="${TF_GLM_MULTI_PARK:-1}"
+export TF_GLM_DISK_CACHE="${TF_GLM_DISK_CACHE:-/cache/pcache}"   # local NVMe cache dir for parked prompts
+export TF_GLM_DISK_CACHE_GIB="${TF_GLM_DISK_CACHE_GIB:-96}"
+export TF_GLM_HOST_CACHE_GIB="${TF_GLM_HOST_CACHE_GIB:-40}"      # RAM tier; TF_GLM_PARK_STAGING_GIB adds 8 pinned
+# x24 (patch 0980): the segmented decode selection through one fused CUDA kernel (TF_GLM_TOPK_V2=0 = x23 path).
+# Selection per decode round 11-37x faster; 400K-context decode 195 -> 227 tok/s (+16%), bit-exact (92/92 GPU checks).
+export TF_GLM_TOPK_V2="${TF_GLM_TOPK_V2:-1}"
+# x25 (patch 0990): write-behind park — park copies into a preallocated pinned staging extent and hands the NVMe
+# write to a background thread. On KV-pool overflow (9 x 400K parked prompts, two runs): worst decode gap
+# 2.05-2.19 s -> 0.86-1.18 s, gap p99 0.43 -> 0.09 s, restores identical. Unset = the synchronous park.
+export TF_GLM_PARK_ASYNC="${TF_GLM_PARK_ASYNC:-1}"
